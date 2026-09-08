@@ -167,6 +167,7 @@ pub fn parse_voice(path_or_buf: Either<String, Buffer>) -> napi::Result<Vec<Voic
     order_by_steamid: false,
     fallback_bytes: None,
     parse_grenades: false,
+    grenade_classes: None,
   };
   let mut parser = Parser::new(settings, parser::parse_demo::ParsingMode::Normal);
   let output = parse_demo(bytes, &mut parser)?;
@@ -206,6 +207,7 @@ pub fn list_game_events(path_or_buf: Either<String, Buffer>) -> napi::Result<Val
     order_by_steamid: false,
     fallback_bytes: None,
     parse_grenades: false,
+    grenade_classes: None,
   };
   let mut parser = Parser::new(settings, parser::parse_demo::ParsingMode::Normal);
   let output = parse_demo(bytes, &mut parser)?;
@@ -219,11 +221,14 @@ pub fn list_game_events(path_or_buf: Either<String, Buffer>) -> napi::Result<Val
 }
 /// extra: lets you add new fields to grenades. Use list_updated_fields for a full list.
 /// grenades: lets you disable non-projectile grenades. This can have a big difference on memory/speed.
+/// grenade_classes: when grenades is enabled, only emit rows for these non-projectile
+/// grenade classes (e.g. inferno flames). Omit to emit every non-projectile class.
 #[napi]
 pub fn parse_grenades(
   path_or_buf: Either<String, Buffer>,
   extra: Option<Vec<String>>,
   grenades: Option<bool>,
+  grenade_classes: Option<Vec<String>>,
 ) -> napi::Result<Value> {
   let bytes = resolve_byte_type(path_or_buf)?;
   let huf = create_huffman_lookup_table();
@@ -254,6 +259,7 @@ pub fn parse_grenades(
     order_by_steamid: false,
     fallback_bytes: None,
     parse_grenades: grenades,
+    grenade_classes: grenade_classes,
   };
   let mut parser = Parser::new(settings, parser::parse_demo::ParsingMode::Normal);
   let output = parse_demo(bytes, &mut parser)?;
@@ -303,6 +309,7 @@ pub fn parse_header(path_or_buf: Either<String, Buffer>) -> napi::Result<Value> 
     order_by_steamid: false,
     fallback_bytes: None,
     parse_grenades: false,
+    grenade_classes: None,
   };
   let mut parser = FirstPassParser::new(&settings);
   let output = match bytes {
@@ -385,6 +392,7 @@ pub fn parse_event(
     order_by_steamid: false,
     fallback_bytes: game_event_list_bytes,
     parse_grenades: false,
+    grenade_classes: None,
   };
   let mut parser = Parser::new(settings, parser::parse_demo::ParsingMode::Normal);
   let output = parse_demo(bytes, &mut parser)?;
@@ -457,6 +465,7 @@ pub fn parse_events(
     order_by_steamid: false,
     fallback_bytes: game_event_list_bytes,
     parse_grenades: false,
+    grenade_classes: None,
   };
   let mut parser = Parser::new(settings, parser::parse_demo::ParsingMode::Normal);
   let output = parse_demo(bytes, &mut parser)?;
@@ -537,6 +546,7 @@ pub fn parse_ticks(
     order_by_steamid: order_by_steamid,
     fallback_bytes: None,
     parse_grenades: false,
+    grenade_classes: None,
   };
 
   let mut parser = Parser::new(settings, parser::parse_demo::ParsingMode::Normal);
@@ -612,6 +622,7 @@ pub fn parse_player_info(path_or_buf: Either<String, Buffer>) -> napi::Result<Va
     order_by_steamid: false,
     fallback_bytes: None,
     parse_grenades: false,
+    grenade_classes: None,
   };
   let mut parser = Parser::new(settings, parser::parse_demo::ParsingMode::Normal);
   let output = parse_demo(bytes, &mut parser)?;
@@ -644,6 +655,7 @@ pub fn parse_player_skins(path_or_buf: Either<String, Buffer>) -> napi::Result<V
     order_by_steamid: false,
     fallback_bytes: None,
     parse_grenades: false,
+    grenade_classes: None,
   };
   let mut parser = Parser::new(settings, parser::parse_demo::ParsingMode::Normal);
   let output = parse_demo(bytes, &mut parser)?;
@@ -675,6 +687,7 @@ pub fn list_updated_fields(path_or_buf: Either<String, Buffer>) -> napi::Result<
     order_by_steamid: false,
     fallback_bytes: None,
     parse_grenades: false,
+    grenade_classes: None,
   };
   let mut parser = Parser::new(settings, parser::parse_demo::ParsingMode::Normal);
   let output = parse_demo(bytes, &mut parser)?;

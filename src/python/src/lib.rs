@@ -138,6 +138,7 @@ impl DemoParser {
             wanted_ticks: vec![],
             parse_projectiles: false,
             parse_grenades: false,
+            grenade_classes: None,
             only_header: true,
             list_props: false,
             only_convars: false,
@@ -166,6 +167,7 @@ impl DemoParser {
             wanted_ticks: vec![],
             parse_projectiles: false,
             parse_grenades: false,
+            grenade_classes: None,
             only_header: false,
             list_props: true,
             only_convars: false,
@@ -192,6 +194,7 @@ impl DemoParser {
             wanted_ticks: vec![],
             parse_projectiles: false,
             parse_grenades: false,
+            grenade_classes: None,
             only_header: false,
             list_props: false,
             only_convars: false,
@@ -214,12 +217,13 @@ impl DemoParser {
     /// 0 -388.875  1295.46875 -5120.0   982              NaN    HeGrenade
     /// 1 -388.875  1295.46875 -5120.0   983              NaN    HeGrenade
     /// 2 -388.875  1295.46875 -5120.0   983              NaN    HeGrenade
-    #[pyo3(signature = (*, extra=None, grenades=true))]
+    #[pyo3(signature = (*, extra=None, grenades=true, grenade_classes=None))]
     pub fn parse_grenades(
         &self,
         py: Python<'_>,
         extra: Option<Vec<String>>,
         grenades: Option<bool>,
+        grenade_classes: Option<Vec<String>>,
     ) -> PyResult<Py<PyAny>> {
         // This function works similarly to parse_ticks but collects the props from grenades instead.
         let wanted_other_props = extra.unwrap_or_default();
@@ -243,6 +247,7 @@ impl DemoParser {
             wanted_ticks: vec![],
             parse_projectiles: true,
             parse_grenades: grenades,
+            grenade_classes: grenade_classes,
             only_header: false,
             list_props: false,
             only_convars: false,
@@ -341,6 +346,7 @@ impl DemoParser {
             wanted_ticks: vec![],
             parse_projectiles: false,
             parse_grenades: false,
+            grenade_classes: None,
             only_header: true,
             list_props: false,
             only_convars: false,
@@ -390,6 +396,7 @@ impl DemoParser {
             wanted_ticks: vec![],
             parse_projectiles: false,
             parse_grenades: false,
+            grenade_classes: None,
             only_header: true,
             list_props: false,
             only_convars: false,
@@ -475,6 +482,7 @@ impl DemoParser {
             wanted_ticks: vec![],
             parse_projectiles: false,
             parse_grenades: false,
+            grenade_classes: None,
             only_header: true,
             list_props: false,
             only_convars: false,
@@ -580,6 +588,7 @@ impl DemoParser {
             wanted_ticks: vec![],
             parse_projectiles: false,
             parse_grenades: false,
+            grenade_classes: None,
             only_header: true,
             list_props: false,
             only_convars: false,
@@ -641,6 +650,7 @@ impl DemoParser {
             wanted_ticks: vec![],
             parse_projectiles: false,
             parse_grenades: false,
+            grenade_classes: None,
             only_header: true,
             list_props: false,
             only_convars: false,
@@ -671,6 +681,7 @@ impl DemoParser {
             parse_ents: false,
             parse_projectiles: false,
             parse_grenades: false,
+            grenade_classes: None,
             only_header: false,
             list_props: false,
             only_convars: false,
@@ -750,6 +761,7 @@ impl DemoParser {
             wanted_ticks,
             parse_projectiles: false,
             parse_grenades: false,
+            grenade_classes: None,
             only_header: true,
             list_props: false,
             only_convars: false,

@@ -61,6 +61,7 @@ pub fn parseEvent(
         wanted_prop_states: HashMap::default().into(),
         fallback_bytes: None,
         parse_grenades: false,
+        grenade_classes: None,
     };
     let mut parser = Parser::new(settings, ForceSingleThreaded);
 
@@ -126,6 +127,7 @@ pub fn parseEvents(
         wanted_prop_states: HashMap::default().into(),
         fallback_bytes: None,
         parse_grenades: false,
+        grenade_classes: None,
     };
     let mut parser = Parser::new(settings, ForceSingleThreaded);
 
@@ -159,6 +161,7 @@ pub fn listGameEvents(fileBytes: Vec<u8>) -> Result<JsValue, JsError> {
         wanted_prop_states: HashMap::default().into(),
         fallback_bytes: None,
         parse_grenades: false,
+        grenade_classes: None,
     };
     let mut parser = Parser::new(settings, ForceSingleThreaded);
 
@@ -192,6 +195,7 @@ pub fn listUpdatedFields(fileBytes: Vec<u8>) -> Result<JsValue, JsError> {
         wanted_prop_states: HashMap::default().into(),
         fallback_bytes: None,
         parse_grenades: false,
+        grenade_classes: None,
     };
     let mut parser = Parser::new(settings, ForceSingleThreaded);
 
@@ -255,6 +259,7 @@ pub fn parseTicks(
         wanted_prop_states: HashMap::default().into(),
         fallback_bytes: None,
         parse_grenades: false,
+        grenade_classes: None,
     };
     let mut parser = Parser::new(settings, ForceSingleThreaded);
 
@@ -292,11 +297,14 @@ pub fn parseTicks(
 }
 /// extra: lets you add new fields to grenades. Use list_updated_fields for a full list.
 /// grenades: lets you disable non-projectile grenades. This can have a big difference on memory/speed.
+/// grenade_classes: when grenades is enabled, only emit rows for these non-projectile
+/// grenade classes (e.g. inferno flames). Omit to emit every non-projectile class.
 #[wasm_bindgen]
 pub fn parseGrenades(
     file: Vec<u8>,
     extra: Option<Vec<JsValue>>,
     grenades: Option<bool>,
+    grenade_classes: Option<Vec<JsValue>>,
 ) -> Result<JsValue, JsError> {
     let mut extra = match extra {
         Some(p) => p.iter().map(|s| s.as_string().unwrap()).collect::<Vec<_>>(),
@@ -307,6 +315,8 @@ pub fn parseGrenades(
         Err(e) => return Err(JsError::new(&format!("{}", e))),
     };
     let grenades = grenades.unwrap_or(true);
+    let grenade_classes = grenade_classes
+        .map(|classes| classes.iter().map(|s| s.as_string().unwrap()).collect::<Vec<_>>());
 
     let arc_huf = Arc::new(create_huffman_lookup_table());
     let mut real_name_to_og_name = HashMap::default();
@@ -330,6 +340,7 @@ pub fn parseGrenades(
         wanted_prop_states: HashMap::default().into(),
         fallback_bytes: None,
         parse_grenades: grenades,
+        grenade_classes: grenade_classes,
     };
     let mut parser = Parser::new(settings, ForceSingleThreaded);
 
@@ -372,6 +383,7 @@ pub fn parseHeader(file: Vec<u8>) -> Result<JsValue, JsError> {
         wanted_prop_states: HashMap::default().into(),
         fallback_bytes: None,
         parse_grenades: false,
+        grenade_classes: None,
     };
     let mut parser = FirstPassParser::new(&settings);
     let output = parser.parse_header_only(&file).unwrap();
