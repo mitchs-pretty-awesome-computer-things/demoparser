@@ -287,7 +287,7 @@ pub fn parseTicks(
         };
         return Ok(s);
     } else {
-        let result = soa_to_aos(helper);
+        let result = soa_to_aos(helper, false);
         let s = match serde_wasm_bindgen::to_value(&result) {
             Ok(s) => s,
             Err(e) => return Err(JsError::new(&format!("{}", e))),
@@ -354,7 +354,10 @@ pub fn parseGrenades(
         prop_infos: prop_infos,
         inner: output.df.into(),
     };
-    let result = soa_to_aos(helper);
+    // Grenade rows are heterogeneous, so missing props are omitted (rather
+    // than emitted as nulls): with wide extras like the 64 CInferno fire
+    // nodes, explicit nulls would multiply every row by the extra count.
+    let result = soa_to_aos(helper, true);
     let s = match serde_wasm_bindgen::to_value(&result) {
         Ok(s) => s,
         Err(e) => return Err(JsError::new(&format!("{}", e))),

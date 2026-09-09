@@ -281,7 +281,7 @@ pub fn parse_grenades(
     prop_infos: prop_infos.clone(),
     inner: output.df.clone().into(),
   };
-  let result = soa_to_aos(helper);
+  let result = soa_to_aos(helper, false);
   match serde_json::to_value(&result) {
     Ok(s) => Ok(s),
     Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
@@ -591,7 +591,7 @@ pub fn parse_ticks(
     };
     return Ok(s);
   } else {
-    let result = soa_to_aos(helper);
+    let result = soa_to_aos(helper, false);
     let s = match serde_json::to_value(&result) {
       Ok(s) => s,
       Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),

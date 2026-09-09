@@ -84,7 +84,9 @@ pub const USERCMD_BUTTONS_RELEASED: u32 = 100000045;
 // FIRE_POSITIONS_BASE + i, mirroring MY_WEAPONS_OFFSET. Chosen clear of
 // existing id ranges.
 pub const FIRE_POSITIONS_BASE: u32 = 700000000;
-// Defensive cap for the sendtable-recorded array length below.
+// Cap for the sendtable-recorded array length below: the length comes from
+// untrusted demo bytes, and each element becomes an output column, so an
+// unbounded length would let a corrupt demo force unbounded allocation.
 pub const FIRE_POSITIONS_MAX: usize = 64;
 
 pub const USERCMD_INPUT_HISTORY_BASEID: u32 = 100001000;
