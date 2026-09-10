@@ -345,13 +345,18 @@ impl PropController {
         // One output column per fire array element; decode flattens element
         // i to FIRE_POSITIONS_BASE + i (see get_propinfo).
         if self.wanted_other_props.contains(&("m_firePositions".to_string())) {
+            let base = self
+                .real_name_to_og_name
+                .get("m_firePositions")
+                .cloned()
+                .unwrap_or_else(|| "m_firePositions".to_string());
             let n = self.fire_positions_len.min(FIRE_POSITIONS_MAX);
             for i in 0..n {
                 self.prop_infos.push(PropInfo {
                     id: FIRE_POSITIONS_BASE + i as u32,
                     prop_type: PropType::Weapon,
                     prop_name: "m_firePositions".to_string(),
-                    prop_friendly_name: format!("m_firePositions.{i}"),
+                    prop_friendly_name: format!("{base}.{i}"),
                     is_player_prop: false,
                 });
             }
@@ -658,4 +663,55 @@ pub fn is_grenade_or_weapon(full_name: &str) -> bool {
     let is_projectile_prop = (split_at_dot[0].contains("Projectile") || split_at_dot[0].contains("Grenade") || split_at_dot[0].contains("Flash"))
         && !split_at_dot[0].contains("Player");
     is_weapon_prop || is_projectile_prop
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn controller_with_fire_mapping(og: Option<&str>) -> PropController {
+        let mut real_name_to_og_name = AHashMap::default();
+        if let Some(og) = og {
+            real_name_to_og_name.insert("m_firePositions".to_string(), og.to_string());
+        }
+        let mut c = PropController::new(
+            vec![],
+            vec!["m_firePositions".to_string()],
+            AHashMap::default(),
+            real_name_to_og_name,
+            false,
+            &[],
+            false,
+        );
+        c.fire_positions_len = 2;
+        c
+    }
+
+    #[test]
+    fn fire_positions_use_caller_friendly_name() {
+        let mut c = controller_with_fire_mapping(Some("Grenade.m_firePositions"));
+        c.set_custom_propinfos();
+        let fire: Vec<_> = c
+            .prop_infos
+            .iter()
+            .filter(|p| p.prop_name == "m_firePositions")
+            .collect();
+        assert_eq!(fire.len(), 2);
+        assert_eq!(fire[0].prop_friendly_name, "Grenade.m_firePositions.0");
+        assert_eq!(fire[1].prop_friendly_name, "Grenade.m_firePositions.1");
+    }
+
+    #[test]
+    fn fire_positions_fall_back_without_mapping() {
+        let mut c = controller_with_fire_mapping(None);
+        c.set_custom_propinfos();
+        let fire: Vec<_> = c
+            .prop_infos
+            .iter()
+            .filter(|p| p.prop_name == "m_firePositions")
+            .collect();
+        assert_eq!(fire.len(), 2);
+        assert_eq!(fire[0].prop_friendly_name, "m_firePositions.0");
+        assert_eq!(fire[1].prop_friendly_name, "m_firePositions.1");
+    }
 }

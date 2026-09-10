@@ -299,12 +299,17 @@ pub fn parseTicks(
 /// grenades: lets you disable non-projectile grenades. This can have a big difference on memory/speed.
 /// grenade_classes: when grenades is enabled, only emit rows for these non-projectile
 /// grenade classes (e.g. inferno flames). Omit to emit every non-projectile class.
+/// skip_nones: when true, omit missing props from rows instead of emitting explicit nulls.
+/// Grenade rows are heterogeneous (projectiles have no fire props, burns have no
+/// coordinates), so with wide extras like the 64 CInferno fire nodes explicit nulls
+/// multiply every row. Defaults to false to preserve legacy null behavior.
 #[wasm_bindgen]
 pub fn parseGrenades(
     file: Vec<u8>,
     extra: Option<Vec<JsValue>>,
     grenades: Option<bool>,
     grenade_classes: Option<Vec<JsValue>>,
+    skip_nones: Option<bool>,
 ) -> Result<JsValue, JsError> {
     let mut extra = match extra {
         Some(p) => p.iter().map(|s| s.as_string().unwrap()).collect::<Vec<_>>(),
@@ -317,6 +322,7 @@ pub fn parseGrenades(
     let grenades = grenades.unwrap_or(true);
     let grenade_classes = grenade_classes
         .map(|classes| classes.iter().map(|s| s.as_string().unwrap()).collect::<Vec<_>>());
+    let skip_nones = skip_nones.unwrap_or(false);
 
     let arc_huf = Arc::new(create_huffman_lookup_table());
     let mut real_name_to_og_name = HashMap::default();
@@ -354,10 +360,12 @@ pub fn parseGrenades(
         prop_infos: prop_infos,
         inner: output.df.into(),
     };
-    // Grenade rows are heterogeneous, so missing props are omitted (rather
-    // than emitted as nulls): with wide extras like the 64 CInferno fire
+    // Grenade rows are heterogeneous (projectiles have no fire props, burns
+    // have no coordinates). When skip_nones is set, missing props are omitted
+    // rather than emitted as nulls: with wide extras like the 64 CInferno fire
     // nodes, explicit nulls would multiply every row by the extra count.
-    let result = soa_to_aos(helper, true);
+    // Defaults to false to preserve legacy null behavior.
+    let result = soa_to_aos(helper, skip_nones);
     let s = match serde_wasm_bindgen::to_value(&result) {
         Ok(s) => s,
         Err(e) => return Err(JsError::new(&format!("{}", e))),
