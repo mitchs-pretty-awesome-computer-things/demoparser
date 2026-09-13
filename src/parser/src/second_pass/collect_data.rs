@@ -19,6 +19,7 @@ use std::fmt;
 pub enum PropType {
     Team,
     Rules,
+    C4,
     Custom,
     Controller,
     Player,
@@ -158,6 +159,7 @@ impl<'a> SecondPassParser<'a> {
             PropType::Button => return self.get_button_prop(&prop_info, &entity_id),
             PropType::Controller => return self.get_controller_prop(&prop_info.id, player),
             PropType::Rules => return self.get_rules_prop(prop_info),
+            PropType::C4 => return self.get_c4_prop(prop_info),
             PropType::GameTime => return Ok(Variant::F32(self.net_tick as f32 / 64.0)),
         }
     }
@@ -233,6 +235,19 @@ impl<'a> SecondPassParser<'a> {
         match self.rules_entity_id {
             Some(entid) => return self.get_prop_from_ent(&prop_info.id, &entid),
             None => return Err(PropCollectionError::RulesEntityIdNotSet),
+        }
+    }
+    pub fn get_c4_prop(&self, prop_info: &PropInfo) -> Result<Variant, PropCollectionError> {
+        // The planted bomb (CPlantedC4) carries the blow timer; the carried
+        // bomb weapon (CC4) does not. Prefer the planted entity when one has
+        // been created, falling back to the carried entity so demos where the
+        // prop lives on CC4 still resolve.
+        if let Some(entid) = self.planted_c4_entity_id {
+            return self.get_prop_from_ent(&prop_info.id, &entid);
+        }
+        match self.c4_entity_id {
+            Some(entid) => return self.get_prop_from_ent(&prop_info.id, &entid),
+            None => return Err(PropCollectionError::C4EntityIdNotSet),
         }
     }
     pub fn get_controller_prop(&self, prop_id: &u32, player: &PlayerMetaData) -> Result<Variant, PropCollectionError> {
@@ -1332,6 +1347,7 @@ pub enum PropCollectionError {
     GetPropFromEntPropNotFound,
     ButtonMaskNotU64Variant,
     RulesEntityIdNotSet,
+    C4EntityIdNotSet,
     ControllerEntityIdNotSet,
     SpecialidsEyeAnglesNotSet,
     SpecialidsItemDefNotSet,

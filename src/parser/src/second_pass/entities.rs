@@ -44,6 +44,7 @@ pub enum EntityType {
     Team,
     Normal,
     C4,
+    PlantedC4,
 }
 enum EntityCmd {
     Delete,
@@ -342,6 +343,7 @@ impl<'a> SecondPassParser<'a> {
             }
             EntityType::Rules => self.rules_entity_id = Some(*entity_id),
             EntityType::C4 => self.c4_entity_id = Some(*entity_id),
+            EntityType::PlantedC4 => self.planted_c4_entity_id = Some(*entity_id),
             _ => {}
         };
         let entity = Entity {
@@ -382,6 +384,7 @@ impl<'a> SecondPassParser<'a> {
             "CCSGameRulesProxy" => return Ok(EntityType::Rules),
             "CCSTeam" => return Ok(EntityType::Team),
             "CC4" => return Ok(EntityType::C4),
+            "CPlantedC4" => return Ok(EntityType::PlantedC4),
             _ => {}
         }
         let is_projectile_prop =
@@ -398,6 +401,7 @@ impl<'a> SecondPassParser<'a> {
 fn should_emit_prop_to_listen(prop_name: &str) -> bool {
     match prop_name.split(".").next() {
         Some("CCSGameRulesProxy") => return true,
+        Some("CPlantedC4") => return true,
         Some("CCSTeam") => return true,
         Some("CCSPlayerPawn") => return true,
         Some("CCSPlayerController") => return true,
