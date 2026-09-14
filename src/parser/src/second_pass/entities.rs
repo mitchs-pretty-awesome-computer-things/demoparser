@@ -79,6 +79,20 @@ impl<'a> SecondPassParser<'a> {
             match cmd {
                 EntityCmd::Delete => {
                     self.projectiles.remove(&entity_id);
+                    // Drop tracked C4 entity ids along with the entity. The
+                    // ids are otherwise left pointing at a cleared slot (or a
+                    // slot reused by another class), which would mask the
+                    // carried-C4 fallback and could resolve stale props.
+                    let deleted_type = self
+                        .entities
+                        .get(entity_id as usize)
+                        .and_then(|slot| slot.as_ref())
+                        .map(|entity| entity.entity_type.clone());
+                    match deleted_type {
+                        Some(EntityType::C4) => self.c4_entity_id = None,
+                        Some(EntityType::PlantedC4) => self.planted_c4_entity_id = None,
+                        _ => {}
+                    }
                     if let Some(entry) = self.entities.get_mut(entity_id as usize) {
                         *entry = None;
                     }

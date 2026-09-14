@@ -238,17 +238,9 @@ impl<'a> SecondPassParser<'a> {
         }
     }
     pub fn get_c4_prop(&self, prop_info: &PropInfo) -> Result<Variant, PropCollectionError> {
-        // The planted bomb (CPlantedC4) carries the blow timer; the carried
-        // bomb weapon (CC4) does not. Prefer the planted entity when one has
-        // been created, falling back to the carried entity so demos where the
-        // prop lives on CC4 still resolve.
-        if let Some(entid) = self.planted_c4_entity_id {
-            return self.get_prop_from_ent(&prop_info.id, &entid);
-        }
-        match self.c4_entity_id {
-            Some(entid) => return self.get_prop_from_ent(&prop_info.id, &entid),
-            None => return Err(PropCollectionError::C4EntityIdNotSet),
-        }
+        resolve_c4_prop(self.planted_c4_entity_id, self.c4_entity_id, &prop_info.id, |prop_id, entity_id| {
+            self.get_prop_from_ent(prop_id, entity_id)
+        })
     }
     pub fn get_controller_prop(&self, prop_id: &u32, player: &PlayerMetaData) -> Result<Variant, PropCollectionError> {
         match player.controller_entid {
@@ -1308,6 +1300,30 @@ impl<'a> SecondPassParser<'a> {
     }
 }
 
+/// Resolve a C4 prop by entity priority: the planted bomb (`CPlantedC4`) first,
+/// then the carried weapon (`CC4`).
+///
+/// Demos differ in which entity actually stores `m_flC4Blow`. Some only expose
+/// it on `CPlantedC4`, others only on `CC4`, and the planted entity is deleted
+/// at the end of each round while its tracked id may linger. Attempting the
+/// planted lookup and falling back to the carried one when it fails keeps the
+/// carried-C4 compatibility path reachable instead of propagating the planted
+/// miss.
+fn resolve_c4_prop<F>(planted_entity_id: Option<i32>, carried_entity_id: Option<i32>, prop_id: &u32, lookup: F) -> Result<Variant, PropCollectionError>
+where
+    F: Fn(&u32, &i32) -> Result<Variant, PropCollectionError>,
+{
+    if let Some(entid) = planted_entity_id {
+        if let Ok(value) = lookup(prop_id, &entid) {
+            return Ok(value);
+        }
+    }
+    match carried_entity_id {
+        Some(entid) => lookup(prop_id, &entid),
+        None => Err(PropCollectionError::C4EntityIdNotSet),
+    }
+}
+
 fn coord_from_cell(cell: Result<Variant, PropCollectionError>, offset: Result<Variant, PropCollectionError>) -> Result<f32, PropCollectionError> {
     // Both cell and offset are needed for calculation
     match (offset, cell) {
@@ -1392,5 +1408,40 @@ impl std::error::Error for PropCollectionError {}
 impl fmt::Display for PropCollectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_c4_prop_prefers_the_planted_entity() {
+        let result = resolve_c4_prop(Some(10), Some(20), &1, |_prop_id, entity_id| Ok(Variant::I32(*entity_id)));
+
+        assert_eq!(result, Ok(Variant::I32(10)));
+    }
+
+    #[test]
+    fn resolve_c4_prop_falls_back_to_the_carried_entity() {
+        // The planted entity exists but does not carry the prop (the CC4-only
+        // compatibility case); the carried lookup must still be attempted.
+        let result = resolve_c4_prop(Some(10), Some(20), &1, |_prop_id, entity_id| match *entity_id {
+            10 => Err(PropCollectionError::GetPropFromEntPropNotFound),
+            other => Ok(Variant::I32(other)),
+        });
+
+        assert_eq!(result, Ok(Variant::I32(20)));
+    }
+
+    #[test]
+    fn resolve_c4_prop_errors_when_neither_entity_resolves() {
+        let neither_set = resolve_c4_prop(None, None, &1, |_prop_id, _entity_id| Ok(Variant::I32(0)));
+        assert_eq!(neither_set, Err(PropCollectionError::C4EntityIdNotSet));
+
+        let both_fail = resolve_c4_prop(Some(10), Some(20), &1, |_prop_id, _entity_id| {
+            Err(PropCollectionError::GetPropFromEntEntityNotFound)
+        });
+        assert_eq!(both_fail, Err(PropCollectionError::GetPropFromEntEntityNotFound));
     }
 }
