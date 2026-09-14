@@ -1220,6 +1220,132 @@ mod tests {
     }
 
     #[test]
+    fn m_flC4Blow_is_classified_as_c4() {
+        let huf = create_huffman_lookup_table();
+
+        let settings = ParserInputs {
+            wanted_players: vec![],
+            real_name_to_og_name: AHashMap::default(),
+            wanted_player_props: vec![],
+            wanted_events: vec!["bomb_planted".to_string()],
+            wanted_other_props: vec!["m_flC4Blow".to_string(), "game_time".to_string()],
+            parse_ents: true,
+            wanted_ticks: vec![],
+            parse_projectiles: false,
+            parse_grenades: false,
+            grenade_classes: None,
+            only_header: false,
+            list_props: false,
+            only_convars: false,
+            huffman_lookup_table: &huf,
+            order_by_steamid: false,
+            wanted_prop_states: AHashMap::default(),
+            fallback_bytes: None,
+        };
+        let mut parser = Parser::new(settings, crate::parse_demo::ParsingMode::ForceSingleThreaded);
+        let file = File::open("test_demo.dem").unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+        let output = parser.parse_demo(&mmap).unwrap();
+
+        // Requesting the bare leaf name must resolve through the C4 mapping
+        // instead of falling through to the generic weapon classification.
+        let info = output
+            .prop_controller
+            .prop_infos
+            .iter()
+            .find(|info| info.prop_name == "m_flC4Blow")
+            .expect("m_flC4Blow should be registered when requested");
+        assert_eq!(info.prop_type, crate::second_pass::collect_data::PropType::C4);
+        assert!(!info.is_player_prop);
+    }
+
+    #[test]
+    fn list_props_collects_c4_blow() {
+        let huf = create_huffman_lookup_table();
+
+        let settings = ParserInputs {
+            wanted_players: vec![],
+            real_name_to_og_name: AHashMap::default(),
+            wanted_player_props: vec![],
+            wanted_events: vec!["none".to_string()],
+            wanted_other_props: vec![],
+            parse_ents: true,
+            wanted_ticks: vec![],
+            parse_projectiles: false,
+            parse_grenades: false,
+            grenade_classes: None,
+            only_header: false,
+            list_props: true,
+            only_convars: false,
+            huffman_lookup_table: &huf,
+            order_by_steamid: false,
+            wanted_prop_states: AHashMap::default(),
+            fallback_bytes: None,
+        };
+        let mut parser = Parser::new(settings, crate::parse_demo::ParsingMode::ForceSingleThreaded);
+        let file = File::open("test_demo.dem").unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+        let output = parser.parse_demo(&mmap).unwrap();
+
+        // parse_ents + list_props is the combination the wasm listUpdatedFields
+        // wrapper must use; without parse_ents the entity pass never runs and
+        // this list is always empty.
+        assert!(!output.uniq_prop_names.is_empty(), "list_props should collect prop names");
+        assert!(
+            output.uniq_prop_names.iter().any(|name| name == "Weapon.m_flC4Blow"),
+            "CPlantedC4.m_flC4Blow should surface as Weapon.m_flC4Blow"
+        );
+    }
+
+    #[test]
+    fn events_carry_c4_blow_from_the_planted_bomb() {
+        let huf = create_huffman_lookup_table();
+
+        let mut real_name_to_og_name = AHashMap::default();
+        real_name_to_og_name.insert("m_flC4Blow".to_string(), "c4_blow".to_string());
+
+        let settings = ParserInputs {
+            wanted_players: vec![],
+            real_name_to_og_name,
+            wanted_player_props: vec![],
+            wanted_events: vec!["all".to_string()],
+            wanted_other_props: vec!["m_flC4Blow".to_string()],
+            parse_ents: true,
+            wanted_ticks: vec![],
+            parse_projectiles: false,
+            parse_grenades: false,
+            grenade_classes: None,
+            only_header: false,
+            list_props: false,
+            only_convars: false,
+            huffman_lookup_table: &huf,
+            order_by_steamid: false,
+            wanted_prop_states: AHashMap::default(),
+            fallback_bytes: None,
+        };
+        let mut parser = Parser::new(settings, crate::parse_demo::ParsingMode::ForceSingleThreaded);
+        let file = File::open("test_demo.dem").unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
+        let output = parser.parse_demo(&mmap).unwrap();
+
+        // The blow timer is attached to every event, but only resolves once the
+        // planted entity exists, so scan all events the way the dashboard does.
+        let blow_values: Vec<f32> = output
+            .game_events
+            .iter()
+            .flat_map(|event| event.fields.iter())
+            .filter(|field| field.name == "c4_blow")
+            .filter_map(|field| match field.data.as_ref() {
+                Some(crate::second_pass::variants::Variant::F32(value)) => Some(*value),
+                _ => None,
+            })
+            .collect();
+
+        assert!(!blow_values.is_empty(), "expected at least one resolved c4_blow value from the planted bomb");
+        assert!(blow_values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
     fn CEconItemAttribute_m_nRefundableCurrency() {
         let prop = (
             "CEconItemAttribute.m_nRefundableCurrency",

@@ -189,6 +189,9 @@ class SignatureTest(TestCase):
 
         updated_fields = parser.list_updated_fields()
         self.assertIsInstance(updated_fields, list)
+        # Populating this list requires the entity pass; an empty result means
+        # parse_ents was not enabled, which is how the wasm binding diverged.
+        self.assertTrue(updated_fields)
         for field in updated_fields:
             self.assertIsInstance(field, str)
 

@@ -673,6 +673,8 @@ pub static TYPEHM: phf::Map<&'static str, PropType> = phf_map! {
     "glove_paint_seed" => PropType::Custom,
     "glove_paint_float" => PropType::Custom,
     "glove_skin" => PropType::Custom,
+    // C4
+    "m_flC4Blow" => PropType::C4,
     // Weapon
     "m_flAnimTime" => PropType::Weapon,
     "m_flSimulationTime"=> PropType::Weapon,
@@ -963,6 +965,7 @@ pub static FRIENDLY_NAMES_MAPPING: phf::Map<&'static str, &'static str> = phf_ma
     "n_best_of_maps"=>"CCSGameRulesProxy.CCSGameRules.m_numBestOfMaps" ,
     "is_bomb_dropped"=>"CCSGameRulesProxy.CCSGameRules.m_bBombDropped" ,
     "is_bomb_planted"=>"CCSGameRulesProxy.CCSGameRules.m_bBombPlanted" ,
+    "c4_blow"=>"m_flC4Blow",
     "round_win_status"=>"CCSGameRulesProxy.CCSGameRules.m_iRoundWinStatus" ,
     "round_win_reason"=>"CCSGameRulesProxy.CCSGameRules.m_eRoundWinReason" ,
     "round_start_count"=>"CCSGameRulesProxy.CCSGameRules.m_nRoundStartCount" ,

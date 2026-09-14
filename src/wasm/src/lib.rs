@@ -184,7 +184,7 @@ pub fn listUpdatedFields(fileBytes: Vec<u8>) -> Result<JsValue, JsError> {
         wanted_player_props: vec![],
         wanted_other_props: vec![],
         wanted_events: vec!["none".to_string()],
-        parse_ents: false,
+        parse_ents: true,
         wanted_ticks: vec![],
         parse_projectiles: false,
         only_header: false,
@@ -203,7 +203,7 @@ pub fn listUpdatedFields(fileBytes: Vec<u8>) -> Result<JsValue, JsError> {
         Ok(output) => output,
         Err(e) => return Err(JsError::new(&format!("{}", e))),
     };
-    let v = Vec::from_iter(output.game_events_counter.iter());
+    let v = Vec::from_iter(output.uniq_prop_names.iter());
     match serde_wasm_bindgen::to_value(&v) {
         Ok(s) => Ok(s),
         Err(e) => return Err(JsError::new(&format!("{}", e))),
