@@ -416,6 +416,9 @@ fn should_emit_prop_to_listen(prop_name: &str) -> bool {
     match prop_name.split(".").next() {
         Some("CCSGameRulesProxy") => return true,
         Some("CPlantedC4") => return true,
+        // The carried C4 (CC4) is also whitelisted so demos that only expose
+        // the blow timer on the carried entity still surface it in list_props.
+        Some("CC4") => return true,
         Some("CCSTeam") => return true,
         Some("CCSPlayerPawn") => return true,
         Some("CCSPlayerController") => return true,
@@ -457,4 +460,24 @@ fn is_grenade_prop(full_name: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn c4_props_are_emitted_to_listeners() {
+        // The blow timer may live on either the planted or the carried bomb
+        // depending on the demo version, so both classes must pass the filter.
+        assert!(should_emit_prop_to_listen("CPlantedC4.m_flC4Blow"));
+        assert!(should_emit_prop_to_listen("CC4.m_flC4Blow"));
+        assert!(!should_emit_prop_to_listen("CEnvEntityMaker.m_flC4Blow"));
+    }
+
+    #[test]
+    fn carried_c4_props_use_the_weapon_prefix() {
+        assert_eq!(convert_weapon_prefix_to_general("CC4.m_flC4Blow"), "Weapon.m_flC4Blow");
+        assert_eq!(convert_weapon_prefix_to_general("CPlantedC4.m_flC4Blow"), "Weapon.m_flC4Blow");
+    }
 }
