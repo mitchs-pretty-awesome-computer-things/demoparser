@@ -83,14 +83,18 @@ impl<'a> SecondPassParser<'a> {
                     // ids are otherwise left pointing at a cleared slot (or a
                     // slot reused by another class), which would mask the
                     // carried-C4 fallback and could resolve stale props.
+                    // Packet entries are ordered by entity id, not lifecycle,
+                    // so only clear a tracker when it points at this exact
+                    // entity; a replacement created earlier in the packet must
+                    // survive the later delete of the entity it replaced.
                     let deleted_type = self
                         .entities
                         .get(entity_id as usize)
                         .and_then(|slot| slot.as_ref())
                         .map(|entity| entity.entity_type.clone());
                     match deleted_type {
-                        Some(EntityType::C4) => self.c4_entity_id = None,
-                        Some(EntityType::PlantedC4) => self.planted_c4_entity_id = None,
+                        Some(EntityType::C4) => self.c4_entity_id = clear_tracker_on_delete(self.c4_entity_id, entity_id),
+                        Some(EntityType::PlantedC4) => self.planted_c4_entity_id = clear_tracker_on_delete(self.planted_c4_entity_id, entity_id),
                         _ => {}
                     }
                     if let Some(entry) = self.entities.get_mut(entity_id as usize) {
@@ -462,9 +466,37 @@ fn is_grenade_prop(full_name: &str) -> bool {
     false
 }
 
+/// Clear a tracked entity id on deletion only when the delete targets that
+/// exact id. Packet entries are ordered by entity id rather than lifecycle, so
+/// a replacement created earlier in the packet must survive the later delete
+/// of the entity it replaced.
+fn clear_tracker_on_delete(tracker: Option<i32>, deleted_entity_id: i32) -> Option<i32> {
+    match tracker {
+        Some(id) if id == deleted_entity_id => None,
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_tracker_on_delete_leaves_replacement_tracked() {
+        // A replacement created earlier in the packet (lower entity id) must
+        // not be wiped by the later delete of the entity it replaced.
+        assert_eq!(clear_tracker_on_delete(Some(30), 50), Some(30));
+    }
+
+    #[test]
+    fn clear_tracker_on_delete_clears_the_tracked_entity() {
+        assert_eq!(clear_tracker_on_delete(Some(50), 50), None);
+    }
+
+    #[test]
+    fn clear_tracker_on_delete_is_a_noop_without_a_tracker() {
+        assert_eq!(clear_tracker_on_delete(None, 50), None);
+    }
 
     #[test]
     fn c4_props_are_emitted_to_listeners() {
