@@ -155,6 +155,8 @@ pub fn parse_voice(path_or_buf: Either<String, Buffer>) -> napi::Result<Vec<Voic
     wanted_player_props: vec![],
     wanted_other_props: vec![],
     wanted_events: vec![],
+    collect_ticks: false,
+    parse_voice: true,
     wanted_ticks: vec![],
     wanted_prop_states: AHashMap::default(),
     real_name_to_og_name: AHashMap::default(),
@@ -197,6 +199,8 @@ pub fn list_game_events(path_or_buf: Either<String, Buffer>) -> napi::Result<Val
     wanted_other_props: vec![],
     wanted_prop_states: AHashMap::default(),
     wanted_events: vec!["all".to_string()],
+    collect_ticks: false,
+    parse_voice: false,
     parse_ents: false,
     wanted_ticks: vec![],
     parse_projectiles: false,
@@ -259,6 +263,8 @@ pub fn parse_grenades(
     wanted_player_props: vec![],
     wanted_other_props: real_extra_props.clone(),
     wanted_events: vec![],
+    collect_ticks: true,
+    parse_voice: false,
     wanted_prop_states: AHashMap::default(),
     parse_ents: true,
     wanted_ticks: vec![],
@@ -305,6 +311,8 @@ pub fn parse_header(path_or_buf: Either<String, Buffer>) -> napi::Result<Value> 
     wanted_other_props: vec![],
     wanted_prop_states: AHashMap::default(),
     wanted_events: vec![],
+    collect_ticks: true,
+    parse_voice: false,
     parse_ents: false,
     wanted_ticks: vec![],
     parse_projectiles: false,
@@ -388,6 +396,8 @@ pub fn parse_event(
     wanted_other_props: real_other_props,
     wanted_prop_states: AHashMap::default(),
     wanted_events: vec![event_name],
+    collect_ticks: false,
+    parse_voice: false,
     parse_ents: true,
     wanted_ticks: vec![],
     parse_projectiles: false,
@@ -461,6 +471,8 @@ pub fn parse_events(
     wanted_other_props: real_other_props.clone(),
     wanted_prop_states: AHashMap::default(),
     wanted_events: event_names,
+    collect_ticks: false,
+    parse_voice: false,
     parse_ents: true,
     wanted_ticks: vec![],
     parse_projectiles: false,
@@ -541,6 +553,8 @@ pub fn parse_ticks(
     wanted_player_props: real_names.clone(),
     wanted_other_props: vec![],
     wanted_events: vec![],
+    collect_ticks: true,
+    parse_voice: false,
     wanted_prop_states: real_wanted_prop_states,
     parse_ents: true,
     wanted_ticks: wanted_ticks,
@@ -606,6 +620,114 @@ pub fn parse_ticks(
   }
 }
 
+/// Bounded-memory slice of `parse_ticks`: only the fullpacket segments
+/// overlapping `[tick_lo, tick_hi]` are decoded and only rows in range are
+/// returned. Same row shape as `parse_ticks`.
+#[napi]
+pub fn parse_tick_range(
+  path_or_buf: Either<String, Buffer>,
+  wanted_props: Vec<String>,
+  tick_lo: i32,
+  tick_hi: i32,
+  wanted_players: Option<Vec<String>>,
+  struct_of_arrays: Option<bool>,
+) -> napi::Result<Value> {
+  let mut real_names = match rm_user_friendly_names(&wanted_props) {
+    Ok(names) => names,
+    Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
+  };
+  let wanted_players_u64 = match wanted_players {
+    Some(v) => v.iter().map(|x| x.parse::<u64>().unwrap_or(0)).collect(),
+    None => vec![],
+  };
+
+  let bytes = resolve_byte_type(path_or_buf)?;
+  let huf = create_huffman_lookup_table();
+  let mut real_name_to_og_name = AHashMap::default();
+
+  for (real_name, user_friendly_name) in real_names.iter().zip(&wanted_props) {
+    real_name_to_og_name.insert(real_name.clone(), user_friendly_name.clone());
+  }
+
+  let settings = ParserInputs {
+    real_name_to_og_name: real_name_to_og_name,
+    wanted_players: wanted_players_u64,
+    wanted_player_props: real_names.clone(),
+    wanted_other_props: vec![],
+    wanted_events: vec![],
+    collect_ticks: true,
+    parse_voice: false,
+    wanted_prop_states: AHashMap::default(),
+    parse_ents: true,
+    wanted_ticks: vec![],
+    parse_projectiles: false,
+    only_header: false,
+    list_props: false,
+    only_convars: false,
+    huffman_lookup_table: &huf,
+    order_by_steamid: false,
+    fallback_bytes: None,
+    parse_grenades: false,
+    grenade_classes: None,
+  };
+
+  let parser = Parser::new(settings, parser::parse_demo::ParsingMode::Normal);
+  let output = match bytes {
+    BytesVariant::Mmap(m) => {
+      let shared = match parser.preparse(&m) {
+        Ok(shared) => shared,
+        Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
+      };
+      match parser.parse_tick_range(&m, shared, tick_lo, tick_hi) {
+        Ok(output) => output,
+        Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
+      }
+    }
+    BytesVariant::Vec(v) => {
+      let shared = match parser.preparse(&v) {
+        Ok(shared) => shared,
+        Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
+      };
+      match parser.parse_tick_range(&v, shared, tick_lo, tick_hi) {
+        Ok(output) => output,
+        Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
+      }
+    }
+  };
+  real_names.push("tick".to_owned());
+  real_names.push("steamid".to_owned());
+  real_names.push("name".to_owned());
+
+  let mut prop_infos = output.prop_controller.prop_infos.clone();
+  prop_infos.sort_by_key(|x| x.prop_name.clone());
+  real_names.sort();
+
+  let helper = OutputSerdeHelperStruct {
+    prop_infos: prop_infos.clone(),
+    inner: output.df.clone().into(),
+  };
+
+  let is_soa = match struct_of_arrays {
+    Some(true) => true,
+    _ => false,
+  };
+
+  if is_soa {
+    let s = match serde_json::to_value(&helper) {
+      Ok(s) => s,
+      Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
+    };
+    return Ok(s);
+  } else {
+    let result = soa_to_aos(helper, false);
+    let s = match serde_json::to_value(&result) {
+      Ok(s) => s,
+      Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
+    };
+    Ok(s)
+  }
+}
+
 #[napi]
 pub fn parse_player_info(path_or_buf: Either<String, Buffer>) -> napi::Result<Value> {
   let bytes = resolve_byte_type(path_or_buf)?;
@@ -618,6 +740,8 @@ pub fn parse_player_info(path_or_buf: Either<String, Buffer>) -> napi::Result<Va
     wanted_other_props: vec![],
     wanted_prop_states: AHashMap::default(),
     wanted_events: vec![],
+    collect_ticks: true,
+    parse_voice: false,
     parse_ents: false,
     wanted_ticks: vec![],
     parse_projectiles: false,
@@ -651,6 +775,8 @@ pub fn parse_player_skins(path_or_buf: Either<String, Buffer>) -> napi::Result<V
     wanted_other_props: vec![],
     wanted_prop_states: AHashMap::default(),
     wanted_events: vec![],
+    collect_ticks: true,
+    parse_voice: false,
     parse_ents: true,
     wanted_ticks: vec![],
     parse_projectiles: false,
@@ -683,6 +809,8 @@ pub fn list_updated_fields(path_or_buf: Either<String, Buffer>) -> napi::Result<
     wanted_other_props: vec![],
     wanted_prop_states: AHashMap::default(),
     wanted_events: vec!["none".to_string()],
+    collect_ticks: false,
+    parse_voice: false,
     parse_ents: true,
     wanted_ticks: vec![],
     parse_projectiles: false,

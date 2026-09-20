@@ -17,6 +17,29 @@ pub struct StringTable {
     flags: i32,
     var_bit_counts: bool,
 }
+
+impl StringTable {
+    /// Heap bytes retained by this table's entries (keys + values).
+    pub fn size_bytes(&self) -> usize {
+        self.data
+            .iter()
+            .map(|e| e.key.len() + e.value.len())
+            .sum::<usize>()
+            + self.name.len()
+    }
+    pub fn entry_count(&self) -> usize {
+        self.data.len()
+    }
+    /// Registry-only copy: keeps index position, name and flags (needed to
+    /// dispatch stringtable updates by table id) but drops retained entries,
+    /// which no second-pass code reads.
+    pub fn without_data(self) -> Self {
+        Self {
+            data: vec![],
+            ..self
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct StringTableEntry {
     pub idx: i32,
@@ -84,7 +107,10 @@ impl<'a> FirstPassParser<'a> {
         let mut bitreader = Bitreader::new(&bytes);
         let mut idx = -1;
         let mut keys: Vec<String> = vec![];
-        let mut items = vec![];
+        // NOTE: entries are intentionally NOT retained (no `items` vec).
+        // The registry (index/name/flags) is all update dispatch reads;
+        // entry keys/values served their inline side effects (userinfo,
+        // baselines, key history) above.
 
         for _upd in 0..n_updates {
             let mut key = "".to_owned();
@@ -166,11 +192,10 @@ impl<'a> FirstPassParser<'a> {
                         Err(_e) => None,
                     };
                 }
-                items.push(StringTableEntry { idx, key, value });
             }
         }
         self.string_tables.push(StringTable {
-            data: items,
+            data: vec![],
             name,
             user_data_size,
             user_data_fixed: udf,
@@ -241,7 +266,10 @@ impl<'a> SecondPassParser<'a> {
         let mut bitreader = Bitreader::new(&bytes);
         let mut idx = -1;
         let mut keys: Vec<String> = vec![];
-        let mut items = vec![];
+        // NOTE: entries are intentionally NOT retained (no `items` vec).
+        // The registry (index/name/flags) is all update dispatch reads;
+        // entry keys/values served their inline side effects (userinfo,
+        // baselines, key history) above.
 
         for _upd in 0..n_updates {
             let mut key = "".to_owned();
@@ -322,11 +350,10 @@ impl<'a> SecondPassParser<'a> {
                         Err(_e) => None,
                     };
                 }
-                items.push(StringTableEntry { idx, key, value });
             }
         }
         self.string_tables.push(StringTable {
-            data: items,
+            data: vec![],
             name,
             user_data_size,
             user_data_fixed: udf,

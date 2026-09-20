@@ -31,6 +31,16 @@ pub struct ParserInputs<'a> {
     pub wanted_prop_states: AHashMap<String, Variant>,
     pub wanted_ticks: Vec<i32>,
     pub wanted_events: Vec<String>,
+    /// Collect per-tick player-prop columns (`df`) during the second pass.
+    /// Historically this was implied by `wanted_events.is_empty()`; making it
+    /// explicit lets one scan collect ticks AND events (the
+    /// `parse_events`-then-`parse_ticks` pattern without two full decodes),
+    /// while event-only queries keep it `false` to avoid materialising `df`.
+    pub collect_ticks: bool,
+    /// Retain voice audio blobs (`voice_data`). Off by default: voice bytes
+    /// would otherwise accumulate unboundedly on every parse while only
+    /// voice queries ever read them.
+    pub parse_voice: bool,
     pub parse_ents: bool,
     pub parse_projectiles: bool,
     pub parse_grenades: bool,
@@ -51,6 +61,9 @@ pub struct FirstPassParser<'a> {
     pub added_temp_props: Vec<String>,
     pub real_name_to_og_name: AHashMap<String, String>,
     pub fullpacket_offsets: Vec<usize>,
+    /// Tick of each `DemFullPacket` frame, parallel to `fullpacket_offsets`.
+    /// Lets range queries binary-search the segment covering a tick.
+    pub fullpacket_ticks: Vec<i32>,
     pub ptr: usize,
     pub tick: i32,
     pub huf: &'a Vec<(u8, u8)>,
@@ -130,6 +143,7 @@ impl<'a> FirstPassParser<'a> {
             convars: AHashMap::default(),
             string_tables: vec![],
             fullpacket_offsets: vec![],
+            fullpacket_ticks: vec![],
             ptr: 0,
             baselines: AHashMap::default(),
             tick: 0,

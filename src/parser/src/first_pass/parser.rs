@@ -1,5 +1,4 @@
 use crate::first_pass::parser_settings::FirstPassParser;
-use crate::first_pass::parser_settings::ParserInputs;
 use crate::first_pass::prop_controller::PropController;
 use crate::first_pass::read_bits::read_varint;
 use crate::first_pass::read_bits::Bitreader;
@@ -31,39 +30,32 @@ use std::sync::Arc;
 
 pub const HEADER_ENDS_AT_BYTE: usize = 16;
 
-pub struct ParserThreadInput<'a> {
-    pub offset: usize,
-    pub settings: &'a ParserInputs<'a>,
-    pub baselines: AHashMap<u32, Vec<u8>>,
-    pub prop_controller: &'a PropController,
-    pub cls_by_id: &'a Vec<Class>,
-    pub qfmap: &'a QfMapper,
-    pub ge_list: &'a AHashMap<i32, DescriptorT>,
-    pub parse_all_packets: bool,
-    pub wanted_ticks: AHashSet<i32>,
-    pub string_tables: Vec<StringTable>,
-    pub stringtable_players: BTreeMap<u64, UserInfo>,
-}
-
-pub struct ClassInfoThreadResult {
-    pub cls_by_id: AHashMap<u32, Class>,
-    pub qf_mapper: QfMapper,
-    pub prop_controller: PropController,
-}
+/// Owned, query-scoped snapshot of everything the second pass needs.
+///
+/// Unlike the old `FirstPassOutput` (which borrowed from `FirstPassParser`),
+/// this owns its data outright, so a single preparse can back a lazy chunk
+/// iterator and be shared by reference across rayon threads without
+/// per-thread clones. Built once per query via `into_shared()`.
 #[derive(Debug, Clone)]
-pub struct FirstPassOutput<'a> {
+pub struct SharedFirstPass {
     pub fullpacket_offsets: Vec<usize>,
-    pub settings: &'a ParserInputs<'a>,
+    /// Tick of each fullpacket, parallel to `fullpacket_offsets`.
+    pub fullpacket_ticks: Vec<i32>,
+    /// Baselines shared across segments (cloned per segment: the second pass
+    /// also absorbs baselines arriving via in-match stringtable updates,
+    /// which the first pass never sees — it skips DemPacket frames).
     pub baselines: AHashMap<u32, Vec<u8>>,
-    pub prop_controller: &'a PropController,
-    pub cls_by_id: &'a Vec<Class>,
-    pub qfmap: &'a QfMapper,
-    pub ge_list: &'a AHashMap<i32, DescriptorT>,
+    pub prop_controller: PropController,
+    pub cls_by_id: Arc<Vec<Class>>,
+    pub qfmap: QfMapper,
+    pub ge_list: AHashMap<i32, DescriptorT>,
     pub wanted_ticks: AHashSet<i32>,
+    pub wanted_players: AHashSet<u64>,
+    // String-table REGISTRY (index/name/flags only, entries pruned): the
+    // second pass dispatches updates by table id, but never reads entries.
     pub string_tables: Vec<StringTable>,
     pub stringtable_players: BTreeMap<i32, UserInfo>,
     pub added_temp_props: Vec<String>,
-    pub wanted_players: AHashSet<u64>,
     pub header: AHashMap<String, String>,
     pub order_by_steamid: bool,
     pub list_props: bool,
@@ -88,7 +80,7 @@ impl<'a> FirstPassParser<'a> {
         self.parse_header(bytes)?;
         Ok(self.header.clone())
     }
-    pub fn parse_demo(&mut self, demo_bytes: &'a [u8], exit_early: bool) -> Result<FirstPassOutput, DemoParserError> {
+    pub fn parse_demo(mut self, demo_bytes: &'a [u8], exit_early: bool) -> Result<SharedFirstPass, DemoParserError> {
         self.handle_short_header(demo_bytes.len(), &demo_bytes[..HEADER_ENDS_AT_BYTE])?;
         let mut reuseable_buffer = vec![0_u8; 100_000];
         // Loop that goes trough the entire file
@@ -128,11 +120,9 @@ impl<'a> FirstPassParser<'a> {
                 _ => {}
             };
         }
-        self.fallback_if_first_pass_missing_data()?;
-        self.create_first_pass_output()
-    }
-
-    fn parse_sendtable_bytes(&mut self, bytes: &[u8]) -> Result<(), DemoParserError> {
+                self.fallback_if_first_pass_missing_data()?;
+        self.into_shared()
+    }    fn parse_sendtable_bytes(&mut self, bytes: &[u8]) -> Result<(), DemoParserError> {
         self.sendtable_message = match CDemoSendTables::decode(bytes) {
             Ok(m) => Some(m),
             Err(_e) => return Err(DemoParserError::MalformedMessage),
@@ -204,33 +194,68 @@ impl<'a> FirstPassParser<'a> {
         }
         Ok(())
     }
-    pub fn create_first_pass_output(&self) -> Result<FirstPassOutput, DemoParserError> {
-        let cls_by_id = match &self.cls_by_id {
+    /// Moves the preparsed state into an owned snapshot. The parser is
+    /// consumed: callers run the first pass once per query, then share the
+    /// snapshot by reference across chunks/threads.
+    pub fn into_shared(self) -> Result<SharedFirstPass, DemoParserError> {
+        let cls_by_id = match self.cls_by_id {
             Some(c) => c,
             None => return Err(DemoParserError::ClassMapperNotFoundFirstPass),
         };
-        Ok(FirstPassOutput {
+        // Keep offsets ascending (the start-of-file fallback appends out of
+        // order) with ticks parallel, so `segments_for_ticks` can
+        // binary-search. Iteration order is irrelevant downstream: MT outputs
+        // are re-sorted by ptr before merging.
+        let mut pairs: Vec<(usize, i32)> = self
+            .fullpacket_offsets
+            .into_iter()
+            .zip(self.fullpacket_ticks.into_iter())
+            .collect();
+        pairs.sort_by_key(|&(off, _)| off);
+        let (fullpacket_offsets, fullpacket_ticks): (Vec<usize>, Vec<i32>) =
+            pairs.into_iter().unzip();
+        if std::env::var("CS2_SIZES").is_ok() {
+            let base_bytes: usize = self.baselines.values().map(|v| v.len()).sum();
+            let st_bytes: usize = self.string_tables.iter().map(|t| t.size_bytes()).sum();
+            let st_entries: usize = self.string_tables.iter().map(|t| t.entry_count()).sum();
+            eprintln!(
+                "[sizes] segments={} baselines={} ({} bytes) string_tables={} tables/{} entries ({} bytes)",
+                fullpacket_offsets.len(),
+                self.baselines.len(),
+                base_bytes,
+                self.string_tables.len(),
+                st_entries,
+                st_bytes
+            );
+        }
+        Ok(SharedFirstPass {
             order_by_steamid: self.order_by_steamid,
-            header: self.header.clone(),
-            fullpacket_offsets: self.fullpacket_offsets.clone(),
-            settings: &self.settings,
-            baselines: self.baselines.clone(),
-            prop_controller: &self.prop_controller,
-            cls_by_id: &cls_by_id,
-            qfmap: &self.qf_mapper,
-            ge_list: &self.ge_list,
-            // arc?
-            wanted_players: self.wanted_players.clone(),
-            wanted_ticks: self.wanted_ticks.clone(),
-            string_tables: self.string_tables.clone(),
-            stringtable_players: self.stringtable_players.clone(),
-            added_temp_props: self.added_temp_props.clone(),
+            header: self.header,
+            fullpacket_offsets,
+            fullpacket_ticks,
+            baselines: self.baselines,
+            prop_controller: self.prop_controller,
+            cls_by_id,
+            qfmap: self.qf_mapper,
+            ge_list: self.ge_list,
+            wanted_players: self.wanted_players,
+            wanted_ticks: self.wanted_ticks,
+            string_tables: self
+                .string_tables
+                .into_iter()
+                .map(StringTable::without_data)
+                .collect(),
+            stringtable_players: self.stringtable_players,
+            added_temp_props: self.added_temp_props,
             list_props: self.list_props,
         })
     }
     fn fallback_if_first_pass_missing_data(&mut self) -> Result<(), DemoParserError> {
         if !self.fullpacket_offsets.contains(&HEADER_ENDS_AT_BYTE) {
             self.fullpacket_offsets.push(HEADER_ENDS_AT_BYTE);
+            // Start-of-file sentinel: sorts before every real tick so range
+            // seeks treat offset 16 as preceding all segments.
+            self.fullpacket_ticks.push(i32::MIN);
         }
         if self.ge_list.is_empty() {
             self.parse_fallback_event_list()?;
@@ -252,6 +277,7 @@ impl<'a> FirstPassParser<'a> {
     }
     pub fn parse_full_packet(&mut self, bytes: &[u8], frame: &Frame) -> Result<(), DemoParserError> {
         self.fullpacket_offsets.push(frame.frame_starts_at);
+        self.fullpacket_ticks.push(frame.tick);
 
         let full_packet = match CDemoFullPacket::decode(bytes) {
             Ok(list) => list,

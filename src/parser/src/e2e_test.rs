@@ -297,11 +297,14 @@ pub fn _create_ge_tests() {
     ];
 
     let wanted_events = vec!["all".to_string()];
+    let collect_ticks = false;
     let huf = create_huffman_lookup_table();
 
     let settings = ParserInputs {
         wanted_player_props: wanted_props.clone(),
         wanted_events: wanted_events,
+        collect_ticks,
+        parse_voice: false,
         real_name_to_og_name: AHashMap::default(),
         wanted_other_props: vec![],
         parse_ents: true,
@@ -393,6 +396,7 @@ pub fn _create_ge_tests() {
 
 pub fn _create_tests() {
     let wanted_events = vec![];
+    let collect_ticks = true;
     let wanted_props = vec![
         "CCSPlayerPawn.CBodyComponentBaseAnimGraph.m_flLastTeleportTime".to_string(),
         "CCSPlayerPawn.CCSPlayer_BulletServices.m_totalHitsOnServer".to_string(),
@@ -679,6 +683,8 @@ pub fn _create_tests() {
     let settings = ParserInputs {
         wanted_player_props: wanted_props.clone(),
         wanted_events: wanted_events,
+        collect_ticks,
+        parse_voice: false,
         real_name_to_og_name: AHashMap::default(),
         wanted_other_props: vec![],
         parse_ents: true,
@@ -1047,12 +1053,15 @@ fn create_data() -> (DemoOutput, PropController, BTreeMap<String, Vec<GameEvent>
     ];
 
     let wanted_events = vec![];
+    let collect_ticks = true;
     let huf = create_huffman_lookup_table();
 
     let settings = ParserInputs {
         fallback_bytes: None,
         wanted_player_props: wanted_props.clone(),
         wanted_events: wanted_events,
+        collect_ticks,
+        parse_voice: false,
         real_name_to_og_name: AHashMap::default(),
         wanted_other_props: vec![],
         parse_ents: true,
@@ -1075,11 +1084,14 @@ fn create_data() -> (DemoOutput, PropController, BTreeMap<String, Vec<GameEvent>
     let out1 = ds.parse_demo(&mmap).unwrap();
 
     let wanted_events = vec!["all".to_string()];
+    let collect_ticks = false;
     let huf = create_huffman_lookup_table();
 
     let settings = ParserInputs {
         wanted_player_props: vec![],
         wanted_events: wanted_events,
+        collect_ticks,
+        parse_voice: false,
         real_name_to_og_name: AHashMap::default(),
         wanted_other_props: vec![],
         parse_ents: true,
@@ -1195,6 +1207,8 @@ mod tests {
             real_name_to_og_name: AHashMap::default(),
             wanted_player_props: vec!["X".to_string()],
             wanted_events: vec![],
+            collect_ticks: true,
+            parse_voice: false,
             wanted_other_props: vec!["CCSTeam.m_iScore".to_string()],
             parse_ents: true,
             wanted_ticks: vec![10000, 10001],
@@ -1228,6 +1242,8 @@ mod tests {
             real_name_to_og_name: AHashMap::default(),
             wanted_player_props: vec![],
             wanted_events: vec!["bomb_planted".to_string()],
+            collect_ticks: false,
+            parse_voice: false,
             wanted_other_props: vec!["m_flC4Blow".to_string(), "game_time".to_string()],
             parse_ents: true,
             wanted_ticks: vec![],
@@ -1268,6 +1284,8 @@ mod tests {
             real_name_to_og_name: AHashMap::default(),
             wanted_player_props: vec![],
             wanted_events: vec!["none".to_string()],
+            collect_ticks: false,
+            parse_voice: false,
             wanted_other_props: vec![],
             parse_ents: true,
             wanted_ticks: vec![],
@@ -1309,6 +1327,8 @@ mod tests {
             real_name_to_og_name,
             wanted_player_props: vec![],
             wanted_events: vec!["all".to_string()],
+            collect_ticks: false,
+            parse_voice: false,
             wanted_other_props: vec!["m_flC4Blow".to_string()],
             parse_ents: true,
             wanted_ticks: vec![],
@@ -18206,6 +18226,8 @@ mod tests {
                 parse_ents: true,
                 wanted_ticks: vec![],
                 wanted_events: vec![],
+                collect_ticks: true,
+                parse_voice: false,
                 parse_projectiles: true,
                 parse_grenades: true,
                 grenade_classes: classes,

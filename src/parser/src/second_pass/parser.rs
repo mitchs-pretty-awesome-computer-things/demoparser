@@ -399,6 +399,12 @@ impl<'a> SecondPassParser<'a> {
     }
 
     pub fn parse_voice_data(&mut self, bytes: &[u8]) -> Result<(), DemoParserError> {
+        // Voice audio bytes are only retained when the caller asked for them;
+        // otherwise this would grow an unbounded Vec of audio blobs on every
+        // parse (ticks/event queries never read it).
+        if !self.parse_voice {
+            return Ok(());
+        }
         if let Ok(m) = CsvcMsgVoiceData::decode(bytes) {
             self.voice_data.push((self.tick, m));
         }

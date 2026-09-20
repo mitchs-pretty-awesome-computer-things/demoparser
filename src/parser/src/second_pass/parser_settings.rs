@@ -1,5 +1,6 @@
 use crate::first_pass::frameparser::StartEndOffset;
-use crate::first_pass::parser::FirstPassOutput;
+use crate::first_pass::parser::SharedFirstPass;
+use crate::first_pass::parser_settings::ParserInputs;
 use crate::first_pass::prop_controller::PropController;
 use crate::first_pass::read_bits::DemoParserError;
 use crate::first_pass::sendtables::Serializer;
@@ -27,6 +28,26 @@ use std::collections::BTreeSet;
 use std::env;
 const HUF_LOOKUPTABLE_MAXVALUE: u32 = (1 << 17) - 1;
 const DEFAULT_MAX_ENTITY_ID: usize = 1024;
+
+/// Per-range row buckets filled during decode when range routing is on.
+#[derive(Debug, Default)]
+pub struct RangedBuckets {
+    /// `dfs[i]` holds rows whose tick falls in `bounds[i]`.
+    pub dfs: Vec<AHashMap<u32, PropColumn>>,
+    /// Same, per player, for `order_by_steamid` queries.
+    pub per_player: Vec<AHashMap<u64, AHashMap<u32, PropColumn>>>,
+}
+
+/// Opt-in row routing for multi-range parses. When set, `collect_entities`
+/// pushes each tick's rows straight into the matching range bucket instead
+/// of the shared output map, so no post-partition copy is needed. `None`
+/// (the default) is the untouched full-parse path.
+#[derive(Debug)]
+pub struct RangeRouting {
+    /// Sorted `(lo, hi)` bounds; bucket `i` collects ticks in `bounds[i]`.
+    pub bounds: Vec<(i32, i32)>,
+    pub buckets: RangedBuckets,
+}
 
 /// Two most recent sampled positions of a player, used to derive velocity.
 ///
@@ -96,6 +117,10 @@ pub struct SecondPassParser<'a> {
     pub player_end_data: Vec<PlayerEndMetaData>,
     // Settings
     pub wanted_events: Vec<String>,
+    pub collect_ticks: bool,
+    pub parse_voice: bool,
+    /// Opt-in row routing (multi-range). `None` = full-parse path.
+    pub range_routing: Option<RangeRouting>,
     pub parse_entities: bool,
     pub parse_projectiles: bool,
     pub parse_grenades: bool,
@@ -189,28 +214,24 @@ impl<'a> SecondPassParser<'a> {
             last_tick: self.tick,
         }
     }
-    pub fn new(
-        first_pass_output: FirstPassOutput<'a>,
+    pub fn new<'s>(
+        shared: &'s SharedFirstPass,
+        settings: &'s ParserInputs<'s>,
         offset: usize,
         parse_all_packets: bool,
         start_end_offset: Option<StartEndOffset>,
-    ) -> Result<Self, DemoParserError> {
-        first_pass_output
-            .settings
-            .wanted_player_props
-            .clone()
-            .extend(vec!["tick".to_owned(), "steamid".to_owned(), "name".to_owned()]);
+    ) -> Result<SecondPassParser<'s>, DemoParserError> {
         let args: Vec<String> = env::args().collect();
         let debug = if args.len() > 2 { args[2] == "true" } else { false };
 
         Ok(SecondPassParser {
             velocity_history: AHashMap::default(),
             uniq_prop_names: AHashSet::default(),
-            parse_usercmd: contains_usercmd_prop(&first_pass_output.settings.wanted_player_props),
+            parse_usercmd: contains_usercmd_prop(&settings.wanted_player_props),
             usercmd_baselines: AHashMap::default(),
             last_tick: 0,
             start_end_offset: start_end_offset,
-            order_by_steamid: first_pass_output.order_by_steamid,
+            order_by_steamid: shared.order_by_steamid,
             df_per_player: AHashMap::default(),
             voice_data: vec![],
             paths: vec![
@@ -220,49 +241,72 @@ impl<'a> SecondPassParser<'a> {
                 };
                 8192
             ],
-            parse_inventory: first_pass_output.prop_controller.wanted_player_props.contains(&"inventory".to_string()),
+            parse_inventory: shared.prop_controller.wanted_player_props.contains(&"inventory".to_string()),
             net_tick: 0,
             c4_entity_id: None,
             planted_c4_entity_id: None,
-            stringtable_players: first_pass_output.stringtable_players,
+            stringtable_players: shared.stringtable_players.clone(),
             is_debug_mode: debug,
             projectile_records: vec![],
             parse_all_packets: parse_all_packets,
-            wanted_players: first_pass_output.wanted_players.clone(),
-            wanted_ticks: first_pass_output.wanted_ticks.clone(),
-            prop_controller: &first_pass_output.prop_controller,
-            qf_mapper: &first_pass_output.qfmap,
+            wanted_players: shared.wanted_players.clone(),
+            wanted_ticks: shared.wanted_ticks.clone(),
+            prop_controller: &shared.prop_controller,
+            qf_mapper: &shared.qfmap,
             fullpackets_parsed: 0,
             serializers: AHashMap::default(),
             ptr: offset,
-            ge_list: first_pass_output.ge_list,
-            cls_by_id: &first_pass_output.cls_by_id,
+            ge_list: &shared.ge_list,
+            cls_by_id: &shared.cls_by_id,
             entities: vec![None; DEFAULT_MAX_ENTITY_ID],
             cls_bits: None,
             tick: -99999,
             players: BTreeMap::default(),
             output: AHashMap::default(),
             game_events: vec![],
-            wanted_events: first_pass_output.settings.wanted_events.clone(),
-            parse_entities: first_pass_output.settings.parse_ents,
+            wanted_events: settings.wanted_events.clone(),
+            collect_ticks: settings.collect_ticks,
+            parse_voice: settings.parse_voice,
+            range_routing: None,
+            parse_entities: settings.parse_ents,
             projectiles: BTreeSet::default(),
-            baselines: first_pass_output.baselines.clone(),
-            string_tables: first_pass_output.string_tables.clone(),
+            baselines: shared.baselines.clone(),
+            string_tables: shared.string_tables.clone(),
             teams: Teams::new(),
             game_events_counter: AHashSet::default(),
-            parse_projectiles: first_pass_output.settings.parse_projectiles,
-            parse_grenades: first_pass_output.settings.parse_grenades,
-            grenade_classes: first_pass_output.settings.grenade_classes.clone(),
+            parse_projectiles: settings.parse_projectiles,
+            parse_grenades: settings.parse_grenades,
+            grenade_classes: settings.grenade_classes.clone(),
             rules_entity_id: None,
             convars: AHashMap::default(),
             chat_messages: vec![],
             item_drops: vec![],
             skins: vec![],
             player_end_data: vec![],
-            huffman_lookup_table: &first_pass_output.settings.huffman_lookup_table,
+            huffman_lookup_table: &settings.huffman_lookup_table,
             header: HashMap::default(),
-            list_props: first_pass_output.list_props,
+            list_props: shared.list_props,
         })
+    }
+
+    /// Enable row routing into per-range buckets (multi-range parses).
+    /// Bounds are sorted; one empty bucket pair is allocated per range.
+    /// The fallthrough collect path is untouched when this is never called.
+    pub fn set_range_routing(&mut self, mut bounds: Vec<(i32, i32)>) {
+        bounds.sort_by_key(|&(lo, _)| lo);
+        let n = bounds.len();
+        self.range_routing = Some(RangeRouting {
+            bounds,
+            buckets: RangedBuckets {
+                dfs: vec![AHashMap::default(); n],
+                per_player: vec![AHashMap::default(); n],
+            },
+        });
+    }
+
+    /// Drain the routed buckets (used with `set_range_routing`).
+    pub fn take_range_buckets(&mut self) -> Option<RangedBuckets> {
+        self.range_routing.take().map(|r| r.buckets)
     }
 }
 

@@ -50,6 +50,8 @@ pub fn parseEvent(
         wanted_other_props: real_other_props,
         real_name_to_og_name: real_name_to_og_name.into(),
         wanted_events: vec![event_name.unwrap_or("none".to_string())],
+        collect_ticks: false,
+        parse_voice: false,
         parse_ents: true,
         wanted_ticks: vec![],
         parse_projectiles: false,
@@ -116,6 +118,8 @@ pub fn parseEvents(
         wanted_other_props: real_other_props,
         real_name_to_og_name: real_name_to_og_name.into(),
         wanted_events: event_names,
+        collect_ticks: false,
+        parse_voice: false,
         parse_ents: true,
         wanted_ticks: vec![],
         parse_projectiles: false,
@@ -150,6 +154,8 @@ pub fn listGameEvents(fileBytes: Vec<u8>) -> Result<JsValue, JsError> {
         wanted_player_props: vec![],
         wanted_other_props: vec![],
         wanted_events: vec!["all".to_string()],
+        collect_ticks: false,
+        parse_voice: false,
         parse_ents: false,
         wanted_ticks: vec![],
         parse_projectiles: false,
@@ -184,6 +190,8 @@ pub fn listUpdatedFields(fileBytes: Vec<u8>) -> Result<JsValue, JsError> {
         wanted_player_props: vec![],
         wanted_other_props: vec![],
         wanted_events: vec!["none".to_string()],
+        collect_ticks: false,
+        parse_voice: false,
         parse_ents: true,
         wanted_ticks: vec![],
         parse_projectiles: false,
@@ -248,6 +256,8 @@ pub fn parseTicks(
         wanted_player_props: real_names.clone(),
         wanted_other_props: vec![],
         wanted_events: vec![],
+        collect_ticks: true,
+        parse_voice: false,
         parse_ents: true,
         wanted_ticks: wanted_ticks,
         parse_projectiles: false,
@@ -264,6 +274,99 @@ pub fn parseTicks(
     let mut parser = Parser::new(settings, ForceSingleThreaded);
 
     let output = match parser.parse_demo(&file) {
+        Ok(output) => output,
+        Err(e) => return Err(JsError::new(&format!("{}", e))),
+    };
+    let mut prop_infos = output.prop_controller.prop_infos.clone();
+    prop_infos.sort_by_key(|x| x.prop_name.clone());
+
+    let helper = OutputSerdeHelperStruct {
+        prop_infos: prop_infos,
+        inner: output.df.into(),
+    };
+
+    let is_soa = match struct_of_arrays {
+        Some(true) => true,
+        _ => false,
+    };
+
+    if is_soa {
+        let s = match serde_wasm_bindgen::to_value(&helper) {
+            Ok(s) => s,
+            Err(e) => return Err(JsError::new(&format!("{}", e))),
+        };
+        return Ok(s);
+    } else {
+        let result = soa_to_aos(helper, false);
+        let s = match serde_wasm_bindgen::to_value(&result) {
+            Ok(s) => s,
+            Err(e) => return Err(JsError::new(&format!("{}", e))),
+        };
+        Ok(s)
+    }
+}
+
+/// Bounded-memory slice of `parseTicks` for browsers: only the fullpacket
+/// segments overlapping `[tick_lo, tick_hi]` are decoded and only rows in
+/// range are returned, so peak memory stays proportional to the slice —
+/// never the whole demo. Same row shape as `parseTicks`.
+#[wasm_bindgen]
+pub fn parseTickRange(
+    file: Vec<u8>,
+    wanted_props: Option<Vec<JsValue>>,
+    tick_lo: i32,
+    tick_hi: i32,
+    wanted_players: Option<Vec<JsValue>>,
+    struct_of_arrays: Option<bool>,
+) -> Result<JsValue, JsError> {
+    let wanted_props = match wanted_props {
+        Some(p) => p.iter().map(|s| s.as_string().unwrap()).collect::<Vec<_>>(),
+        None => vec![],
+    };
+    let wanted_players_u64 = match wanted_players {
+        Some(v) => v
+            .iter()
+            .map(|x| x.as_string().unwrap().parse::<u64>().unwrap_or(0))
+            .collect(),
+        None => vec![],
+    };
+    let real_names = match rm_user_friendly_names(&wanted_props) {
+        Ok(names) => names,
+        Err(e) => return Err(JsError::new(&format!("{}", e))),
+    };
+    let arc_huf = Arc::new(create_huffman_lookup_table());
+    let mut real_name_to_og_name = HashMap::default();
+    for (real_name, user_friendly_name) in real_names.iter().zip(&wanted_props) {
+        real_name_to_og_name.insert(real_name.clone(), user_friendly_name.clone());
+    }
+    let settings = ParserInputs {
+        wanted_players: wanted_players_u64,
+        real_name_to_og_name: real_name_to_og_name.into(),
+        wanted_player_props: real_names.clone(),
+        wanted_other_props: vec![],
+        wanted_events: vec![],
+        collect_ticks: true,
+        parse_voice: false,
+        parse_ents: true,
+        wanted_ticks: vec![],
+        parse_projectiles: false,
+        only_header: false,
+        list_props: false,
+        only_convars: false,
+        huffman_lookup_table: &arc_huf.clone(),
+        order_by_steamid: false,
+        wanted_prop_states: HashMap::default().into(),
+        fallback_bytes: None,
+        parse_grenades: false,
+        grenade_classes: None,
+    };
+    let parser = Parser::new(settings, ForceSingleThreaded);
+
+    let shared = match parser.preparse(&file) {
+        Ok(shared) => shared,
+        Err(e) => return Err(JsError::new(&format!("{}", e))),
+    };
+    let output = match parser.parse_tick_range(&file, shared, tick_lo, tick_hi) {
         Ok(output) => output,
         Err(e) => return Err(JsError::new(&format!("{}", e))),
     };
@@ -335,6 +438,8 @@ pub fn parseGrenades(
         wanted_player_props: vec![],
         wanted_other_props: real_names.clone(),
         wanted_events: vec![],
+        collect_ticks: true,
+        parse_voice: false,
         parse_ents: true,
         wanted_ticks: vec![],
         parse_projectiles: true,
@@ -383,6 +488,8 @@ pub fn parseHeader(file: Vec<u8>) -> Result<JsValue, JsError> {
         wanted_player_props: vec![],
         wanted_other_props: vec![],
         wanted_events: vec![],
+        collect_ticks: true,
+        parse_voice: false,
         parse_ents: false,
         wanted_ticks: vec![],
         parse_projectiles: true,
