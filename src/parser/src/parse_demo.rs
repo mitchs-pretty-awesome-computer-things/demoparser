@@ -996,7 +996,7 @@ impl<'a> Parser<'a> {
         &self,
         outer_bytes: &[u8],
         shared: &SharedFirstPass,
-        reciever: Receiver<StartEndOffset>,
+        receiver: Receiver<StartEndOffset>,
     ) -> Result<DemoOutput, DemoParserError> {
         thread::scope(|s| {
             let mut handles = vec![];
@@ -1004,7 +1004,7 @@ impl<'a> Parser<'a> {
             let input = &self.input;
             let shared_ref = shared;
             loop {
-                if let Ok(start_end_offset) = reciever.recv_timeout(Duration::from_secs(3)) {
+                if let Ok(start_end_offset) = receiver.recv_timeout(Duration::from_secs(3)) {
                     match start_end_offset.msg_type {
                         StartEndType::EndOfMessages => break,
                         StartEndType::OK => {}
