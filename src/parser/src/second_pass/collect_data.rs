@@ -1,6 +1,7 @@
 use super::entities::PlayerMetaData;
 use super::variants::Sticker;
 use super::variants::Variant;
+use crate::entity_handle::entity_handle_index;
 use crate::first_pass::prop_controller::*;
 use crate::first_pass::read_bits::DemoParserError;
 use crate::maps::BUTTONMAP;
@@ -342,7 +343,7 @@ impl<'a> SecondPassParser<'a> {
             None => return Err(PropCollectionError::GrenadeOwnerIdNotSet),
         };
         match self.get_prop_from_ent(&owner_id, entity_id) {
-            Ok(Variant::U32(prop)) => Ok(prop & 0x7FF),
+            Ok(Variant::U32(prop)) => Ok(entity_handle_index(prop) as u32),
             Ok(_) => return Err(PropCollectionError::GrenadeOwnerIdPropIncorrectVariant),
             Err(e) => return Err(e),
         }
@@ -659,7 +660,7 @@ impl<'a> SecondPassParser<'a> {
             return match self.get_prop_from_ent(&p, &eid) {
                 Ok(Variant::U32(weap_handle)) => {
                     // Could be more specific
-                    let weapon_entity_id = (weap_handle & 0x7FF) as i32;
+                    let weapon_entity_id = entity_handle_index(weap_handle);
                     self.find_stickers(&weapon_entity_id)
                 }
                 Ok(_) => Err(PropCollectionError::WeaponHandleIncorrectVariant),
@@ -928,7 +929,7 @@ impl<'a> SecondPassParser<'a> {
             match self.get_prop_from_ent(&(prop_id as u32), entity_id) {
                 Err(_e) => {}
                 Ok(Variant::U32(x)) => {
-                    let eid = (x & ((1 << 14) - 1)) as i32;
+                    let eid = entity_handle_index(x);
                     // Sometimes multiple references to same eid?
                     if unique_eids.contains(&eid) {
                         continue;
@@ -966,7 +967,7 @@ impl<'a> SecondPassParser<'a> {
             match self.get_prop_from_ent(&(prop_id as u32), entity_id) {
                 Err(_e) => {}
                 Ok(Variant::U32(x)) => {
-                    let eid = (x & ((1 << 14) - 1)) as i32;
+                    let eid = entity_handle_index(x);
                     // Sometimes multiple references to same eid?
                     if unique_eids.contains(&eid) {
                         continue;
@@ -1003,7 +1004,7 @@ impl<'a> SecondPassParser<'a> {
             match self.get_prop_from_ent(&(prop_id as u32), entity_id) {
                 Err(_e) => {}
                 Ok(Variant::U32(x)) => {
-                    let eid = (x & ((1 << 14) - 1)) as i32;
+                    let eid = entity_handle_index(x);
                     // Sometimes multiple references to same eid?
                     if unique_eids.contains(&eid) {
                         continue;
@@ -1115,7 +1116,7 @@ impl<'a> SecondPassParser<'a> {
         if let Some(c4ent) = self.c4_entity_id {
             if let Some(id) = self.prop_controller.special_ids.h_owner_entity {
                 if let Ok(Variant::U32(u)) = self.get_prop_from_ent(&id, &c4ent) {
-                    return Some((u & 0x7FF) as i32);
+                    return Some(entity_handle_index(u));
                 }
             }
         }
@@ -1169,7 +1170,7 @@ impl<'a> SecondPassParser<'a> {
         };
         return match self.get_prop_from_ent(&p, player_entid) {
             Ok(Variant::U32(weap_handle)) => {
-                let weapon_entity_id = (weap_handle & 0x7FF) as i32;
+                let weapon_entity_id = entity_handle_index(weap_handle);
                 self.find_weapon_skin_id(&weapon_entity_id)
             }
             Ok(_) => Err(PropCollectionError::WeaponHandleIncorrectVariant),
@@ -1197,7 +1198,7 @@ impl<'a> SecondPassParser<'a> {
         };
         return match self.get_prop_from_ent(&p, player_entid) {
             Ok(Variant::U32(weap_handle)) => {
-                let weapon_entity_id = (weap_handle & 0x7FF) as i32;
+                let weapon_entity_id = entity_handle_index(weap_handle);
                 self.find_weapon_skin(&weapon_entity_id)
             }
             Ok(_) => Err(PropCollectionError::WeaponHandleIncorrectVariant),
@@ -1260,7 +1261,7 @@ impl<'a> SecondPassParser<'a> {
         match self.get_prop_from_ent(&p, player_entid) {
             Ok(Variant::U32(weap_handle)) => {
                 // Could be more specific
-                let weapon_entity_id = (weap_handle & 0x7FF) as i32;
+                let weapon_entity_id = entity_handle_index(weap_handle);
                 match self.get_prop_from_ent(&prop, &weapon_entity_id) {
                     Ok(p) => Ok(p),
                     Err(e) => match e {
@@ -1347,7 +1348,7 @@ impl<'a> SecondPassParser<'a> {
             };
             let player_entid = match self.prop_controller.special_ids.player_pawn {
                 Some(id) => match self.get_prop_from_ent(&id, entity_id) {
-                    Ok(Variant::U32(handle)) => Some((handle & 0x7FF) as i32),
+                    Ok(Variant::U32(handle)) => Some(entity_handle_index(handle)),
                     Ok(_) => return Err(DemoParserError::IncorrectMetaDataProp),
                     Err(_) => None,
                 },
