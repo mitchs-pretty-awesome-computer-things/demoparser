@@ -261,11 +261,19 @@ impl<'a> Parser<'a> {
     /// so callers can process and drop chunks one at a time to bound peak
     /// memory instead of merging the whole demo via `combine_chunks`.
     pub fn iter_chunks<'b>(&'b self, demo_bytes: &'b [u8], shared: SharedFirstPass) -> ChunkIter<'a, 'b> {
+        self.iter_chunks_from(demo_bytes, shared, 0)
+    }
+    /// Same as `iter_chunks` but resumes at segment `start_idx` (an index
+    /// into `shared.fullpacket_offsets`) instead of 0. The WASM `ChunkParser`
+    /// handle persists its cursor across `nextChunk` calls and resumes here,
+    /// so each segment is decoded exactly once. An out-of-range `start_idx`
+    /// simply yields an empty iterator.
+    pub fn iter_chunks_from<'b>(&'b self, demo_bytes: &'b [u8], shared: SharedFirstPass, start_idx: usize) -> ChunkIter<'a, 'b> {
         ChunkIter {
             shared,
             inputs: &self.input,
             bytes: demo_bytes,
-            next_idx: 0,
+            next_idx: start_idx,
         }
     }
     /// Parse only the segments overlapping tick range `[lo, hi]` and trim
