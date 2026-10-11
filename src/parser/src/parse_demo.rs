@@ -4,6 +4,7 @@ use crate::first_pass::parser_settings::check_multithreadability;
 use crate::first_pass::parser_settings::{FirstPassParser, ParserInputs};
 use crate::first_pass::prop_controller::{PropController, NAME_ID, STEAMID_ID, TICK_ID};
 use crate::first_pass::read_bits::DemoParserError;
+use crate::maps::NON_MULTITHREADABLE_PROPS;
 use crate::second_pass::collect_data::ProjectileRecord;
 use crate::second_pass::game_events::{EventField, GameEvent};
 use crate::second_pass::parser::SecondPassOutput;
@@ -194,6 +195,16 @@ fn segment_tick_span(shared: &SharedFirstPass, seg_idx: usize) -> (i32, i32) {
     (lo, hi)
 }
 
+/// Names from `wanted_player_props` that carry cross-fullpacket state and
+/// therefore cannot be decoded per-segment (see `NON_MULTITHREADABLE_PROPS`).
+fn non_multithreadable_requested(props: &[String]) -> Vec<String> {
+    props
+        .iter()
+        .filter(|name| NON_MULTITHREADABLE_PROPS.contains(*name))
+        .cloned()
+        .collect()
+}
+
 /// Drop `df` / `df_per_player` rows and game events outside `[lo, hi]`.
 /// Boundary segments decode out-of-range ticks (needed for entity state),
 /// so the merged result is trimmed after. Range-agnostic metadata (skins,
@@ -222,16 +233,20 @@ fn trim_to_tick_range(out: &mut DemoOutput, lo: i32, hi: i32) {
             }
         }
         out.df = trimmed;
-        for (_, per_player) in out.df_per_player.iter_mut() {
-            if let Some(w) = indices_in_range(per_player, lo, hi) {
-                let mut t = AHashMap::default();
-                for (k, v) in per_player.iter() {
-                    if let Some(new) = v.slice_to_new(&w) {
-                        t.insert(*k, new);
-                    }
+    }
+    // Always trim per-player maps on their OWN tick column. With
+    // `order_by_steamid` rows live in `df_per_player` while `out.df` has no
+    // tick column, so gating this loop on `out.df`'s trim would skip it and
+    // return every tick of the boundary segments untrimmed.
+    for (_, per_player) in out.df_per_player.iter_mut() {
+        if let Some(w) = indices_in_range(per_player, lo, hi) {
+            let mut t = AHashMap::default();
+            for (k, v) in per_player.iter() {
+                if let Some(new) = v.slice_to_new(&w) {
+                    t.insert(*k, new);
                 }
-                *per_player = t;
             }
+            *per_player = t;
         }
     }
     out.game_events.retain(|e| e.tick >= lo && e.tick <= hi);
@@ -288,28 +303,72 @@ impl<'a> Parser<'a> {
         hi: i32,
     ) -> Result<DemoOutput, DemoParserError> {
         let seg_range = segments_for_ticks(&shared, lo, hi);
-        let selected: Vec<usize> = shared.fullpacket_offsets[seg_range].to_vec();
-        // WASM has no threads: rayon would have nowhere to run, so parse
-        // segments serially there. Native keeps the parallel segment parse.
-        #[cfg(target_arch = "wasm32")]
-        let mut outputs: Vec<SecondPassOutput> = {
-            let mut v = Vec::with_capacity(selected.len());
-            for offset in &selected {
-                let mut parser = SecondPassParser::new(&shared, &self.input, *offset, false, None)?;
+        let selected: Vec<usize> = shared.fullpacket_offsets[seg_range.clone()].to_vec();
+        // Props that accumulate cross-fullpacket state (damage counters,
+        // duck/crouch state, ...) reset at every per-segment boundary and
+        // would diverge from the full parse. Decode the selected interval
+        // CONTINUOUSLY instead: one parser from the first selected
+        // fullpacket, bounded to the end of the last selected segment (the
+        // next fullpacket offset, or EOF). Bound construction mirrors
+        // `second_pass_threaded_with_channels`; the first fullpacket seeds
+        // entity state from the snapshot and later ones apply as deltas (see
+        // `parse_full_packet_and_break_if_needed`), exactly like the
+        // continuous full parse.
+        let mut outputs: Vec<SecondPassOutput> = if !check_multithreadability(&self.input.wanted_player_props) {
+            if selected.is_empty() {
+                vec![]
+            } else {
+                // Start one fullpacket BEFORE the first selected segment (or
+                // at byte 16 when it is included): frame ticks can plateau
+                // across a segment boundary, so in-range rows may physically
+                // sit just before the first selected fullpacket — notably
+                // around demo start, where tick-1 rows precede the first
+                // tick-1 fullpacket. Frame ticks are monotonic, so one
+                // segment back always covers them; the extra decode is
+                // trimmed away below.
+                let start = if seg_range.start <= 1 {
+                    HEADER_ENDS_AT_BYTE
+                } else {
+                    shared.fullpacket_offsets[seg_range.start - 1]
+                };
+                let end = shared
+                    .fullpacket_offsets
+                    .get(seg_range.end)
+                    .copied()
+                    .unwrap_or(demo_bytes.len());
+                let bound = StartEndOffset {
+                    start,
+                    end,
+                    msg_type: StartEndType::OK,
+                };
+                let mut parser = SecondPassParser::new(&shared, &self.input, start, false, Some(bound))?;
                 parser.start(demo_bytes)?;
-                v.push(parser.create_output());
+                vec![parser.create_output()]
             }
-            v
+        } else {
+            // WASM has no threads: rayon would have nowhere to run, so parse
+            // segments serially there. Native keeps the parallel segment parse.
+            #[cfg(target_arch = "wasm32")]
+            let mut outputs: Vec<SecondPassOutput> = {
+                let mut v = Vec::with_capacity(selected.len());
+                for offset in &selected {
+                    let mut parser = SecondPassParser::new(&shared, &self.input, *offset, false, None)?;
+                    parser.start(demo_bytes)?;
+                    v.push(parser.create_output());
+                }
+                v
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            let mut outputs: Vec<SecondPassOutput> = selected
+                .par_iter()
+                .map(|offset| {
+                    let mut parser = SecondPassParser::new(&shared, &self.input, *offset, false, None)?;
+                    parser.start(demo_bytes)?;
+                    Ok(parser.create_output())
+                })
+                .collect::<Result<Vec<_>, DemoParserError>>()?;
+            outputs
         };
-        #[cfg(not(target_arch = "wasm32"))]
-        let mut outputs: Vec<SecondPassOutput> = selected
-            .par_iter()
-            .map(|offset| {
-                let mut parser = SecondPassParser::new(&shared, &self.input, *offset, false, None)?;
-                parser.start(demo_bytes)?;
-                Ok(parser.create_output())
-            })
-            .collect::<Result<Vec<_>, DemoParserError>>()?;
         let mut out = self.combine_chunks(&mut outputs, &shared);
         Parser::remove_duplicate_player_connects(&mut out.game_events);
         Parser::add_item_purchase_sell_column(&mut out.game_events);
@@ -323,6 +382,11 @@ impl<'a> Parser<'a> {
     /// Fixes the N× decode + N× post-proc cost of calling `parse_tick_range`
     /// per range. Rows in overlapping ranges go to the first range (sorted by
     /// `lo`); rows outside all ranges are dropped. Returned in input order.
+    ///
+    /// Rejects non-multithreadable props (damage counters, duck state, ...):
+    /// each segment is decoded exactly once with rows routed per range, so
+    /// cross-segment state cannot be preserved. Use `parse_tick_range` or
+    /// the full `parse_demo` for those props.
     pub fn parse_tick_ranges(
         &self,
         demo_bytes: &[u8],
@@ -337,6 +401,8 @@ impl<'a> Parser<'a> {
     /// `batch_size`; each group decodes its union once and post-processes
     /// once. Event post-proc is per-group, so cross-group sell matching
     /// falls back to range-local semantics at group edges (documented).
+    ///
+    /// Like `parse_tick_ranges`, rejects non-multithreadable props.
     pub fn parse_tick_ranges_grouped(
         &self,
         demo_bytes: &[u8],
@@ -359,6 +425,18 @@ impl<'a> Parser<'a> {
     ) -> Result<Vec<DemoOutput>, DemoParserError> {
         if ranges.is_empty() {
             return Ok(vec![]);
+        }
+        // Non-multithreadable props (damage counters, duck state, ...) carry
+        // state across fullpacket boundaries, but this path decodes each
+        // segment exactly once with rows routed per range, so that state
+        // cannot be preserved. Fail loudly instead of returning
+        // silently-wrong rows; callers needing those props should use
+        // `parse_tick_range` (continuous fallback) or the full `parse_demo`.
+        if !check_multithreadability(&self.input.wanted_player_props) {
+            return Err(DemoParserError::NonMultithreadableProps(format!(
+                "parse_tick_ranges cannot serve non-multithreadable props {:?}: per-segment decode cannot carry their state across segments; use parse_tick_range or parse_demo instead",
+                non_multithreadable_requested(&self.input.wanted_player_props)
+            )));
         }
         // Deterministic assignment: sort by lo, first match wins.
         let mut sorted: Vec<(i32, i32, usize)> = ranges

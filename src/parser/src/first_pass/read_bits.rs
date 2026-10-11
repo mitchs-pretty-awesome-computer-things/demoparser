@@ -249,6 +249,7 @@ pub enum DemoParserError {
     ImpossibleCmd,
     UnkVoiceFormat,
     MalformedVoicePacket,
+    NonMultithreadableProps(String),
 }
 
 impl std::error::Error for DemoParserError {}

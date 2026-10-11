@@ -151,10 +151,25 @@ impl<'a> SecondPassParser<'a> {
         if let Some(start_end_offset) = self.start_end_offset {
             if self.ptr > start_end_offset.end {
                 return Ok(true);
-            } else {
-                self.parse_full_packet(&bytes, true, buf)?;
-                return Ok(false);
             }
+            // Bounded CONTINUOUS decode (see `Parser::parse_tick_range`): only
+            // the first fullpacket seeds entity state from the snapshot;
+            // later fullpackets apply as deltas so live cross-fullpacket
+            // state (damage counters, duck state, ...) is preserved — the
+            // same handling as the continuous full parse
+            // (`parse_all_packets = true`). Re-seeding at every fullpacket
+            // would reset that state at each boundary and diverge from the
+            // full parse. Single-segment users of this branch (e.g.
+            // `second_pass_threaded_with_channels`) break at their second
+            // fullpacket, so they only ever take the seed path.
+            // No seeding when the bound starts at byte 16: signon frames
+            // already built that state live, mirroring the
+            // `started_at != HEADER_ENDS_AT_BYTE` case below.
+            let snapshot = self.fullpackets_parsed == 0
+                && start_end_offset.start != HEADER_ENDS_AT_BYTE;
+            self.parse_full_packet(&bytes, snapshot, buf)?;
+            self.fullpackets_parsed += 1;
+            return Ok(false);
         }
         match self.parse_all_packets {
             true => {

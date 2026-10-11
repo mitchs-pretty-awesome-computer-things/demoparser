@@ -2,6 +2,7 @@ use parser::first_pass::parser::SharedFirstPass;
 use parser::first_pass::parser_settings::rm_user_friendly_names;
 use parser::first_pass::parser_settings::FirstPassParser;
 use parser::first_pass::parser_settings::ParserInputs;
+use parser::maps::NON_MULTITHREADABLE_PROPS;
 use parser::parse_demo::Parser;
 use parser::parse_demo::ParsingMode::ForceSingleThreaded;
 use parser::second_pass::parser_settings::create_huffman_lookup_table;
@@ -11,7 +12,15 @@ use std::collections::HashMap;
 use std::iter::FromIterator;
 use std::result::Result;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use wasm_bindgen::prelude::*;
+
+/// The huffman lookup table must outlive the `Parser` stored in a
+/// `ChunkParser` handle (its settings borrow the table), so it cannot live
+/// on the stack like in the one-shot bindings above. ONE table (~131,072
+/// entries) is shared by every handle in this wasm instance instead of
+/// leaking one per handle.
+static HUFFMAN_TABLE: OnceLock<Vec<(u8, u8)>> = OnceLock::new();
 
 #[wasm_bindgen]
 pub fn parseEvent(
@@ -582,17 +591,29 @@ impl ChunkParser {
             Ok(names) => names,
             Err(e) => return Err(JsError::new(&format!("{}", e))),
         };
+        // Damage counters, duck/crouch state, etc. accumulate state across
+        // fullpacket segments; per-segment streaming fundamentally cannot
+        // carry that state, so reject them loudly instead of returning
+        // silently-wrong rows. `parseTicks`/`parse_demo` decode continuously
+        // and serve these props correctly.
+        let offending: Vec<&str> = real_names
+            .iter()
+            .filter(|name| NON_MULTITHREADABLE_PROPS.contains(name.as_str()))
+            .map(|s| s.as_str())
+            .collect();
+        if !offending.is_empty() {
+            return Err(JsError::new(&format!(
+                "ChunkParser streaming cannot serve non-multithreadable props {:?}: chunked parsing cannot carry their state across segments; use parseTicks/parse_demo instead",
+                offending
+            )));
+        }
         let mut real_name_to_og_name = HashMap::default();
         for (real_name, user_friendly_name) in real_names.iter().zip(&opts.wanted_props) {
             real_name_to_og_name.insert(real_name.clone(), user_friendly_name.clone());
         }
-        // The huffman table must outlive the stored `Parser`. The one-shot
-        // bindings borrow a stack-local table because `Parser::new` doesn't
-        // retain it, but a struct-stored parser needs a `'static` borrow: leak
-        // one small table per handle. The handle is short-lived and
-        // `free`/`Drop` releases everything else, so the leaked table is the
-        // only per-handle cost that outlives it.
-        let huf: &'static Vec<(u8, u8)> = Box::leak(Box::new(create_huffman_lookup_table()));
+        // Shared `'static` table (see `HUFFMAN_TABLE`): no per-handle leak,
+        // and the borrow outlives the stored `Parser` as required.
+        let huf: &'static Vec<(u8, u8)> = HUFFMAN_TABLE.get_or_init(create_huffman_lookup_table);
         // Settings mirror `parseTicks` (ticks mode) and `parseGrenades`
         // (grenades mode) exactly so chunk rows match the one-shot shape.
         let settings = if is_grenades {
