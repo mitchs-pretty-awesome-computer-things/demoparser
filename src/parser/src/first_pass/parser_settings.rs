@@ -113,6 +113,23 @@ pub fn needs_velocity(props: &[String]) -> bool {
     false
 }
 
+/// Names from `wanted_player_props` that require a continuous decode and
+/// therefore cannot be served per-segment: props carrying
+/// cross-fullpacket state (`NON_MULTITHREADABLE_PROPS` — damage counters,
+/// duck state, ...) plus velocity-derived props (their two-sample
+/// position history resets at every segment head, so chunked output
+/// matches the multi-threaded parse but not the continuous one-shot).
+/// Empty means the query is safe to split by segment. The velocity half
+/// uses the same `contains("velo")` predicate as `needs_velocity` so every
+/// rejection site and fallback agrees on what counts as velocity.
+pub fn continuous_decode_required(props: &[String]) -> Vec<String> {
+    props
+        .iter()
+        .filter(|name| NON_MULTITHREADABLE_PROPS.contains(name.as_str()) || name.contains("velo"))
+        .cloned()
+        .collect()
+}
+
 impl<'a> FirstPassParser<'a> {
     pub fn new(inputs: &'a ParserInputs<'a>) -> Self {
         FirstPassParser {

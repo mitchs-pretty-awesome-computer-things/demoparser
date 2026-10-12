@@ -1,10 +1,11 @@
 use crate::first_pass::frameparser::{FrameParser, StartEndOffset, StartEndType};
 use crate::first_pass::parser::SharedFirstPass;
 use crate::first_pass::parser_settings::check_multithreadability;
+use crate::first_pass::parser_settings::continuous_decode_required;
+use crate::first_pass::parser_settings::needs_velocity;
 use crate::first_pass::parser_settings::{FirstPassParser, ParserInputs};
 use crate::first_pass::prop_controller::{PropController, NAME_ID, STEAMID_ID, TICK_ID};
 use crate::first_pass::read_bits::DemoParserError;
-use crate::maps::NON_MULTITHREADABLE_PROPS;
 use crate::second_pass::collect_data::ProjectileRecord;
 use crate::second_pass::game_events::{EventField, GameEvent};
 use crate::second_pass::parser::SecondPassOutput;
@@ -133,6 +134,23 @@ struct MiscBucket {
 /// single-range outputs despite identical values. Residual edge: a prop
 /// valued only outside ALL ranges degrades to a dropped (vs null) column,
 /// matching full-parse representation for that range.
+///
+/// SoA-only residual (documented, not fixed): row (AoS) outputs always
+/// carry every requested key — `soa_to_aos` emits untyped nulls without
+/// needing a type — but `structOfArrays` serialization omits columns with
+/// no typed values, so a prop valued only outside the decoded ranges is
+/// absent from a bounded SoA map while the full parse emits a null-filled
+/// column. This was investigated and deliberately left: a prop id's
+/// `Variant` type cannot be derived cleanly from sendtable metadata.
+/// `PropInfo` carries only `PropType` (Player/Weapon/Custom/...), and the
+/// column type is decided post-decode in the second pass (`find_prop`
+/// retypes several props — spotted masks `U32`→`U64Vec`, colors `I32`→
+/// `String`, coordinates computed as `F32` regardless of decoder — while
+/// custom-derived props like velocity/inventory/stickers never pass
+/// through a single decoder at all). A registry would hand-map every one
+/// of those paths and silently mistype columns on any drift, which is
+/// worse than an omitted column; bounded SoA outputs keep the narrower
+/// behavior.
 fn normalize_segment_buckets(rb: &mut RangedBuckets) {
     let mut templates: AHashMap<u32, Variant> = AHashMap::default();
     for m in rb.dfs.iter() {
@@ -157,9 +175,9 @@ fn normalize_segment_buckets(rb: &mut RangedBuckets) {
 }
 
 /// Dummy `Variant` matching a materialized `VarVec`'s type, used to build
-/// an all-`None` column of the same type (see `empty_like` and
-/// `normalize_chunk_df`). Shared with `normalize_segment_buckets` so both
-/// paths agree on the materialized representation.
+/// an all-`None` column of the same type (see `empty_like`). Shared with
+/// `normalize_segment_buckets` so all materialization agrees on the
+/// representation.
 fn dummy_for(data: &VarVec) -> Variant {
     match data {
         VarVec::Bool(_) => Variant::Bool(false),
@@ -208,32 +226,6 @@ fn materialize_nones(m: &mut AHashMap<u32, PropColumn>, templates: &AHashMap<u32
     }
 }
 
-/// Accumulated per-prop-id variant templates for chunk serialization (see
-/// `normalize_chunk_df`). Kept opaque so the wasm crate never names the
-/// map type; one handle accumulates across its `nextChunk` calls.
-#[derive(Default)]
-pub struct ChunkTemplates {
-    inner: AHashMap<u32, Variant>,
-}
-
-/// Streaming twin of `normalize_segment_buckets` for one chunk `df`:
-/// harvest templates from the chunk's materialized columns into
-/// `templates`, then materialize the chunk's `None`-only columns that
-/// have a template into explicit-null columns of the chunk's row length,
-/// so `soa_to_aos` emits nulls instead of dropping the keys.
-///
-/// Templates accumulate across chunks because a single segment may never
-/// materialize a prop (e.g. a chunk with projectile rows but no inferno
-/// rows) that neighboring segments do; without the accumulated template
-/// those keys would be dropped while the full parse emits nulls. Residual
-/// edge (same as the ranged path): a prop with no template in any
-/// decoded-so-far chunk degrades to a dropped column, matching
-/// full-parse representation for an all-`None` column.
-pub fn normalize_chunk_df(df: &mut AHashMap<u32, PropColumn>, templates: &mut ChunkTemplates) {
-    harvest_templates(df, &mut templates.inner);
-    materialize_nones(df, &templates.inner);
-}
-
 /// Tick span covered by segment `seg_idx`: `[tick_i, tick_{i+1})`, last runs
 /// through EOF. Used to assign range-agnostic items (skins, chat, voice) to
 /// overlapping ranges.
@@ -242,16 +234,6 @@ fn segment_tick_span(shared: &SharedFirstPass, seg_idx: usize) -> (i32, i32) {
     let lo = ticks.get(seg_idx).copied().unwrap_or(i32::MIN);
     let hi = ticks.get(seg_idx + 1).copied().unwrap_or(i32::MAX);
     (lo, hi)
-}
-
-/// Names from `wanted_player_props` that carry cross-fullpacket state and
-/// therefore cannot be decoded per-segment (see `NON_MULTITHREADABLE_PROPS`).
-fn non_multithreadable_requested(props: &[String]) -> Vec<String> {
-    props
-        .iter()
-        .filter(|name| NON_MULTITHREADABLE_PROPS.contains(*name))
-        .cloned()
-        .collect()
 }
 
 /// Drop `df` / `df_per_player` rows and game events outside `[lo, hi]`.
@@ -325,9 +307,9 @@ impl<'a> Parser<'a> {
     /// so callers can process and drop chunks one at a time to bound peak
     /// memory instead of merging the whole demo via `combine_chunks`.
     ///
-    /// Rejects non-multithreadable props (damage counters, duck state, ...):
-    /// per-segment decode cannot carry their cross-segment state, so
-    /// streaming them would return silently-reset values. Use
+    /// Rejects props that require a continuous decode (cross-segment state
+    /// or velocity-derived props): per-segment decode cannot carry their
+    /// state, so streaming them would return silently-reset values. Use
     /// `parse_tick_range` or the full `parse_demo` for those props.
     pub fn iter_chunks<'b>(&'b self, demo_bytes: &'b [u8], shared: SharedFirstPass) -> Result<ChunkIter<'a, 'b>, DemoParserError> {
         self.iter_chunks_from(demo_bytes, shared, 0)
@@ -343,10 +325,11 @@ impl<'a> Parser<'a> {
         shared: SharedFirstPass,
         start_idx: usize,
     ) -> Result<ChunkIter<'a, 'b>, DemoParserError> {
-        if !check_multithreadability(&self.input.wanted_player_props) {
+        let offending = continuous_decode_required(&self.input.wanted_player_props);
+        if !offending.is_empty() {
             return Err(DemoParserError::NonMultithreadableProps(format!(
-                "iter_chunks cannot serve non-multithreadable props {:?}: per-segment decode cannot carry their state across segments; use parse_tick_range or parse_demo instead",
-                non_multithreadable_requested(&self.input.wanted_player_props)
+                "iter_chunks cannot serve props {:?} that require cross-segment state or continuous decode (stateful props or velocity-derived props): per-segment decode cannot carry their state across segments; use parse_tick_range or parse_demo instead",
+                offending
             )));
         }
         Ok(ChunkIter {
@@ -360,6 +343,16 @@ impl<'a> Parser<'a> {
     /// rows/events outside it. Segment decode is byte-identical to the full
     /// parse by construction (same per-segment path); out-of-range rows from
     /// the boundary segments are dropped after merging.
+    ///
+    /// Unlike the per-segment surfaces (`parse_tick_ranges`, `iter_chunks`,
+    /// `ChunkParser`), this serves props that require a continuous decode —
+    /// cross-segment state and velocity-derived props — via the continuous
+    /// fallback below, so velocity here matches the full one-shot parse.
+    ///
+    /// SoA-only caveat (see `normalize_segment_buckets`): row outputs
+    /// carry every requested key as nulls when never valued in range, but
+    /// `structOfArrays` serialization omits such never-valued columns while
+    /// the full parse emits null-filled ones.
     pub fn parse_tick_range(
         &self,
         demo_bytes: &[u8],
@@ -372,15 +365,19 @@ impl<'a> Parser<'a> {
         let selected: Vec<usize> = shared.fullpacket_offsets[sel_range.clone()].to_vec();
         // Props that accumulate cross-fullpacket state (damage counters,
         // duck/crouch state, ...) reset at every per-segment boundary and
-        // would diverge from the full parse. Decode the selected interval
-        // CONTINUOUSLY instead: one parser from the first selected
+        // would diverge from the full parse. Velocity-derived props have
+        // the same problem: their two-sample position history restarts at
+        // each segment head. Decode the selected interval CONTINUOUSLY
+        // instead: one parser from the first selected
         // fullpacket, bounded to the end of the last selected segment (the
         // next fullpacket offset, or EOF). Bound construction mirrors
         // `second_pass_threaded_with_channels`; the first fullpacket seeds
         // entity state from the snapshot and later ones apply as deltas (see
         // `parse_full_packet_and_break_if_needed`), exactly like the
         // continuous full parse.
-        let mut outputs: Vec<SecondPassOutput> = if !check_multithreadability(&self.input.wanted_player_props) {
+        let mut outputs: Vec<SecondPassOutput> = if !check_multithreadability(&self.input.wanted_player_props)
+            || needs_velocity(&self.input.wanted_player_props)
+        {
             if selected.is_empty() {
                 vec![]
             } else {
@@ -449,10 +446,11 @@ impl<'a> Parser<'a> {
     /// per range. Rows in overlapping ranges go to the first range (sorted by
     /// `lo`); rows outside all ranges are dropped. Returned in input order.
     ///
-    /// Rejects non-multithreadable props (damage counters, duck state, ...):
-    /// each segment is decoded exactly once with rows routed per range, so
-    /// cross-segment state cannot be preserved. Use `parse_tick_range` or
-    /// the full `parse_demo` for those props.
+    /// Rejects props that require a continuous decode (cross-segment state
+    /// or velocity-derived props): each segment is decoded exactly once
+    /// with rows routed per range, so that state cannot be preserved. Use
+    /// `parse_tick_range` (continuous fallback) or the full `parse_demo`
+    /// for those props.
     pub fn parse_tick_ranges(
         &self,
         demo_bytes: &[u8],
@@ -468,7 +466,8 @@ impl<'a> Parser<'a> {
     /// once. Event post-proc is per-group, so cross-group sell matching
     /// falls back to range-local semantics at group edges (documented).
     ///
-    /// Like `parse_tick_ranges`, rejects non-multithreadable props.
+    /// Like `parse_tick_ranges`, rejects props that require a continuous
+    /// decode (cross-segment state or velocity-derived props).
     pub fn parse_tick_ranges_grouped(
         &self,
         demo_bytes: &[u8],
@@ -492,16 +491,17 @@ impl<'a> Parser<'a> {
         if ranges.is_empty() {
             return Ok(vec![]);
         }
-        // Non-multithreadable props (damage counters, duck state, ...) carry
-        // state across fullpacket boundaries, but this path decodes each
-        // segment exactly once with rows routed per range, so that state
-        // cannot be preserved. Fail loudly instead of returning
+        // Props that require a continuous decode (cross-fullpacket state,
+        // velocity-derived props) cannot be served here: this path decodes
+        // each segment exactly once with rows routed per range, so that
+        // state cannot be preserved. Fail loudly instead of returning
         // silently-wrong rows; callers needing those props should use
         // `parse_tick_range` (continuous fallback) or the full `parse_demo`.
-        if !check_multithreadability(&self.input.wanted_player_props) {
+        let offending = continuous_decode_required(&self.input.wanted_player_props);
+        if !offending.is_empty() {
             return Err(DemoParserError::NonMultithreadableProps(format!(
-                "parse_tick_ranges cannot serve non-multithreadable props {:?}: per-segment decode cannot carry their state across segments; use parse_tick_range or parse_demo instead",
-                non_multithreadable_requested(&self.input.wanted_player_props)
+                "parse_tick_ranges cannot serve props {:?} that require cross-segment state or continuous decode (stateful props or velocity-derived props): per-segment decode cannot carry their state across segments; use parse_tick_range or parse_demo instead",
+                offending
             )));
         }
         // Deterministic assignment: sort by lo, first match wins.
@@ -604,7 +604,10 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Assemble one DemoOutput per range (input order).
+        // Assemble one DemoOutput per range (input order). SoA-only
+        // residual (see `normalize_segment_buckets`): row outputs carry
+        // every requested key, but `structOfArrays` serialization omits
+        // columns never valued in the decoded segments.
         let mut results: Vec<DemoOutput> = Vec::with_capacity(n);
         for orig in 0..n {
             let mut prop_controller = shared.prop_controller.clone();

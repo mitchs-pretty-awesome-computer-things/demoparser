@@ -1,12 +1,10 @@
 use parser::first_pass::parser::SharedFirstPass;
+use parser::first_pass::parser_settings::continuous_decode_required;
 use parser::first_pass::parser_settings::rm_user_friendly_names;
 use parser::first_pass::parser_settings::FirstPassParser;
 use parser::first_pass::parser_settings::ParserInputs;
 use parser::first_pass::prop_controller::PropInfo;
-use parser::maps::NON_MULTITHREADABLE_PROPS;
-use parser::parse_demo::ChunkTemplates;
 use parser::parse_demo::Parser;
-use parser::parse_demo::normalize_chunk_df;
 use parser::parse_demo::ParsingMode::ForceSingleThreaded;
 use parser::second_pass::parser_settings::create_huffman_lookup_table;
 use parser::second_pass::variants::soa_to_aos;
@@ -553,6 +551,13 @@ struct ChunkOpts {
 /// proportional to one segment instead of the whole demo. Row shape matches
 /// `parseTicks` (ticks mode) or `parseGrenades` (grenades mode).
 ///
+/// Grenades mode note: pass `grenadeClasses` (e.g. `["CInferno"]`) for parity
+/// with one-shot `parseGrenades`. Unfiltered output also carries weapon-class
+/// rows (CC4/knives/guns map to grenade types in the entity-name table), and
+/// per-segment decode tracks those extra entity lifetimes differently from the
+/// continuous one-shot, so unfiltered row counts can differ from
+/// `parseGrenades` (every actual grenade class matches when filtered).
+///
 /// One handle serves exactly one mode; the consumer creates one handle per
 /// pass, so one `Parser` + one preparse per handle is sufficient.
 #[wasm_bindgen]
@@ -574,10 +579,6 @@ struct ChunkParserInner {
     /// preparse: temp velocity props (X/Y/Z) filtered out here, not per
     /// chunk, so chunk rows never leak implementation-only columns.
     prop_infos: Vec<PropInfo>,
-    /// Accumulated per-prop variant templates for null materialization:
-    /// grows as chunks decode, so a chunk that never materializes a prop
-    /// still emits explicit nulls like the one-shot parse.
-    templates: ChunkTemplates,
 }
 
 #[wasm_bindgen]
@@ -602,19 +603,17 @@ impl ChunkParser {
             Ok(names) => names,
             Err(e) => return Err(JsError::new(&format!("{}", e))),
         };
-        // Damage counters, duck/crouch state, etc. accumulate state across
-        // fullpacket segments; per-segment streaming fundamentally cannot
-        // carry that state, so reject them loudly instead of returning
-        // silently-wrong rows. `parseTicks`/`parse_demo` decode continuously
-        // and serve these props correctly.
-        let offending: Vec<&str> = real_names
-            .iter()
-            .filter(|name| NON_MULTITHREADABLE_PROPS.contains(name.as_str()))
-            .map(|s| s.as_str())
-            .collect();
+        // Props that require a continuous decode — cross-fullpacket state
+        // (damage counters, duck/crouch state, ...) and velocity-derived
+        // props, whose two-sample history resets at every segment head —
+        // cannot be carried across per-segment streaming, so reject them
+        // loudly instead of returning silently-wrong rows.
+        // `parseTicks`/`parse_demo` decode continuously and serve these
+        // props correctly.
+        let offending = continuous_decode_required(&real_names);
         if !offending.is_empty() {
             return Err(JsError::new(&format!(
-                "ChunkParser streaming cannot serve non-multithreadable props {:?}: chunked parsing cannot carry their state across segments; use parseTicks/parse_demo instead",
+                "ChunkParser streaming cannot serve props {:?} that require cross-segment state or continuous decode (stateful props or velocity-derived props): chunked parsing cannot carry their state across segments; use parseTicks/parse_demo instead",
                 offending
             )));
         }
@@ -695,7 +694,6 @@ impl ChunkParser {
                 chunk_count,
                 skip_nones: if is_grenades { opts.skip_nones.unwrap_or(false) } else { false },
                 prop_infos,
-                templates: ChunkTemplates::default(),
             }),
         })
     }
@@ -726,7 +724,7 @@ impl ChunkParser {
         }
         let idx = inner.next_idx;
         inner.next_idx += 1;
-        let mut segment = {
+        let segment = {
             // `ChunkIter` owns its snapshot, so hand it a clone. The per-segment
             // `SecondPassParser::new` clones the same tables again per segment, so
             // this matches the existing per-chunk clone cost (no asymptotic change).
@@ -742,11 +740,12 @@ impl ChunkParser {
             }
         };
         // Same serialization as `parseTickRange`, with the
-        // constructor-filtered prop infos (no temp X/Y/Z leak) and
-        // `None`-only columns materialized to explicit nulls (matching the
-        // `parseTicks`/`parseGrenades` row shape). The segment `df` is the
-        // same `AHashMap<u32, PropColumn>` type as `DemoOutput`'s.
-        normalize_chunk_df(&mut segment.df, &mut inner.templates);
+        // constructor-filtered prop infos (no temp X/Y/Z leak). Untyped or
+        // absent columns serialize as explicit nulls via `soa_to_aos`
+        // (matching the `parseTicks`/`parseGrenades` row shape), so no
+        // per-chunk template accumulation is needed: a null needs no type.
+        // The segment `df` is the same `AHashMap<u32, PropColumn>` type as
+        // `DemoOutput`'s.
         let helper = OutputSerdeHelperStruct {
             prop_infos: inner.prop_infos.clone(),
             inner: segment.df.into(),

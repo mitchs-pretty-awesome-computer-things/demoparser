@@ -115,10 +115,22 @@ fn print_cksum_tagged(out: &DemoOutput, tag: &str) {
     eprintln!("[{tag}] df={:016x} cols={} per_player={}", h.finish(), out.df.len(), out.df_per_player.len());
 }
 
+/// Per-segment surfaces (`iter_chunks`, `parse_tick_ranges`) reject
+/// velocity props — the two-sample history cannot cross segment heads —
+/// so the chunked/batched bench modes strip them to keep running. Uses the
+/// same `contains("velo")` predicate as `needs_velocity`. Singular-range
+/// and full-parse modes keep velocity (continuous decode serves it).
+fn strip_velocity_props(settings: &mut ParserInputs) {
+    settings.wanted_player_props.retain(|p| !p.contains("velo"));
+}
+
 /// Streaming proof: preparse once, pull chunks lazily, merge at the end.
-/// `df` must equal the MT parse bit-for-bit (same per-segment path).
+/// `df` must equal the MT parse bit-for-bit (same per-segment path,
+/// modulo the stripped velocity columns — see `strip_velocity_props`).
 fn run_once_chunked(mmap: &[u8], huf: &Vec<(u8, u8)>) -> f64 {
-    let parser = Parser::new(settings(huf), ParsingMode::ForceMultiThreaded);
+    let mut s = settings(huf);
+    strip_velocity_props(&mut s);
+    let parser = Parser::new(s, ParsingMode::ForceMultiThreaded);
     let t = Instant::now();
     let shared = parser.preparse(mmap).expect("preparse");
     let n_segments = shared.fullpacket_offsets.len();
@@ -199,7 +211,10 @@ fn run_once_ranges(mmap: &[u8], huf: &Vec<(u8, u8)>) -> f64 {
     use parser::second_pass::variants::VarVec;
     let t = Instant::now();
     let bounds = round_bounds(mmap, huf);
-    let ticks_parser = Parser::new(settings_with(huf, vec![], true), ParsingMode::ForceMultiThreaded);
+    let mut ticks_settings = settings_with(huf, vec![], true);
+    // `parse_tick_ranges` rejects velocity props (see `strip_velocity_props`).
+    strip_velocity_props(&mut ticks_settings);
+    let ticks_parser = Parser::new(ticks_settings, ParsingMode::ForceMultiThreaded);
     let shared = ticks_parser.preparse(mmap).expect("preparse");
     // CS2_BATCH=k: grouped batching dial (k ranges per batch; default: all).
     let batch: usize = std::env::var("CS2_BATCH")

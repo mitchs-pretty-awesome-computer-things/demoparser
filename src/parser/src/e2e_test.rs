@@ -18262,3 +18262,404 @@ mod tests {
         assert_eq!(filtered.len(), expected);
     }
 }
+
+/// Parity between the full parse and every bounded/streamed surface.
+///
+/// Root cause these pin down: a requested prop with no typed column in the
+/// decoded data (its first value lives outside the decoded segments/range)
+/// used to vanish from bounded outputs while the full parse emits it as
+/// nulls. `soa_to_aos` now emits untyped nulls, so all four paths below
+/// must agree row-for-row. Runs on the git-tracked `test_demo.dem` in CI.
+#[cfg(test)]
+mod parity_tests {
+    use crate::e2e_test::DemoOutput;
+    use crate::first_pass::parser_settings::rm_user_friendly_names;
+    use crate::first_pass::parser_settings::ParserInputs;
+    use crate::first_pass::prop_controller::TICK_ID;
+    use crate::parse_demo::Parser;
+    use crate::second_pass::parser_settings::create_huffman_lookup_table;
+    use crate::second_pass::variants::{soa_to_aos, OutputSerdeHelperStruct, VarVec, Variant};
+    use crate::first_pass::read_bits::DemoParserError;
+    use ahash::AHashMap;
+    use lazy_static::lazy_static;
+    use memmap2::MmapOptions;
+    use std::collections::{BTreeSet, HashMap};
+    use std::fs::File;
+
+    type Row = HashMap<String, Option<Variant>>;
+
+    /// Per-segment-safe prop set (no cross-segment state, no velocity):
+    /// every bounded surface must serve these bit-identically.
+    fn std_props() -> Vec<String> {
+        vec![
+            "X", "Y", "Z", "health", "armor_value", "pitch", "yaw", "is_alive",
+            "active_weapon_name", "balance", "m_iClip2",
+            "CCSPlayerPawn.m_flFlashDuration", "CCSPlayerPawn.m_bIsScoped",
+            "CCSPlayerPawn.m_iShotsFired", "CCSPlayerPawn.m_szLastPlaceName",
+            "CCSPlayerPawn.CCSPlayer_MovementServices.m_flStamina",
+            "CCSPlayerController.m_iPing", "game_time",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    fn inputs_for<'a>(huf: &'a Vec<(u8, u8)>, wanted: &[String]) -> ParserInputs<'a> {
+        let real = rm_user_friendly_names(&wanted.to_vec()).unwrap();
+        let mut og = AHashMap::default();
+        for (r, f) in real.iter().zip(wanted) {
+            og.insert(r.clone(), f.clone());
+        }
+        ParserInputs {
+            wanted_players: vec![],
+            real_name_to_og_name: og,
+            wanted_player_props: real,
+            wanted_other_props: vec![],
+            wanted_events: vec![],
+            collect_ticks: true,
+            parse_voice: false,
+            parse_ents: true,
+            wanted_ticks: vec![],
+            parse_projectiles: false,
+            parse_grenades: false,
+            grenade_classes: None,
+            only_header: false,
+            list_props: false,
+            only_convars: false,
+            huffman_lookup_table: huf,
+            order_by_steamid: false,
+            wanted_prop_states: AHashMap::default(),
+            fallback_bytes: None,
+        }
+    }
+
+    fn load_demo() -> memmap2::Mmap {
+        let file = File::open("test_demo.dem").unwrap();
+        unsafe { MmapOptions::new().map(&file).unwrap() }
+    }
+
+    lazy_static! {
+        // Full multi-threaded parse over the standard set: the reference
+        // every bounded surface must match inside the tested ranges.
+        static ref FULL_MT_STD: DemoOutput = {
+            let mmap = load_demo();
+            let huf = create_huffman_lookup_table();
+            let mut parser = Parser::new(inputs_for(&huf, &std_props()), crate::parse_demo::ParsingMode::Normal);
+            parser.parse_demo(&mmap).unwrap()
+        };
+        // Full single-threaded parse over std + c4_blow + velocity: reference
+        // for the null-interval and velocity cases (ST serves velocity).
+        static ref FULL_ST_WIDE: DemoOutput = {
+            let mmap = load_demo();
+            let huf = create_huffman_lookup_table();
+            let mut wanted = std_props();
+            wanted.extend(
+                vec!["c4_blow", "velocity", "velocity_X", "velocity_Y", "velocity_Z"]
+                    .iter()
+                    .map(|s| s.to_string()),
+            );
+            let mut parser = Parser::new(inputs_for(&huf, &wanted), crate::parse_demo::ParsingMode::ForceSingleThreaded);
+            parser.parse_demo(&mmap).unwrap()
+        };
+        static ref SHARED_STD: crate::first_pass::parser::SharedFirstPass = {
+            let mmap = load_demo();
+            let huf = create_huffman_lookup_table();
+            Parser::new(inputs_for(&huf, &std_props()), crate::parse_demo::ParsingMode::Normal)
+                .preparse(&mmap)
+                .unwrap()
+        };
+    }
+
+    fn prop_infos_sorted(out: &DemoOutput) -> Vec<crate::first_pass::prop_controller::PropInfo> {
+        let mut infos = out.prop_controller.prop_infos.clone();
+        infos.sort_by_key(|x| x.prop_name.clone());
+        infos
+    }
+
+    fn aos_rows(out: &DemoOutput) -> Vec<Row> {
+        let helper = OutputSerdeHelperStruct {
+            prop_infos: prop_infos_sorted(out),
+            inner: out.df.clone().into(),
+        };
+        soa_to_aos(helper, false)
+    }
+
+    /// Rows of `out` restricted to ticks in `[lo, hi]`, without cloning the
+    /// whole frame: columns are sliced to the wanted indices first, so even
+    /// the full-parse reference only materializes the tested window.
+    fn rows_in_range(out: &DemoOutput, lo: i32, hi: i32) -> Vec<Row> {
+        let wanted: Vec<usize> = match out.df.get(&TICK_ID).and_then(|c| c.data.as_ref()) {
+            Some(VarVec::I32(ticks)) => ticks
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, t)| match t {
+                    Some(t) if *t >= lo && *t <= hi => Some(idx),
+                    _ => None,
+                })
+                .collect(),
+            _ => panic!("tick column missing"),
+        };
+        let mut trimmed = AHashMap::default();
+        for (k, v) in out.df.iter() {
+            if let Some(new) = v.slice_to_new(&wanted) {
+                trimmed.insert(*k, new);
+            }
+        }
+        let helper = OutputSerdeHelperStruct {
+            prop_infos: prop_infos_sorted(out),
+            inner: trimmed.into(),
+        };
+        soa_to_aos(helper, false)
+    }
+
+    /// Canonical row string: entries sorted by key so row order comparisons
+    /// do not depend on `HashMap` iteration order.
+    fn canon(row: &Row) -> String {
+        let mut entries: Vec<(&String, &Option<Variant>)> = row.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        format!("{:?}", entries)
+    }
+
+    /// Whether a column holds at least one decoded value (any `VarVec`
+    /// shape). Cheap precondition check that avoids converting the whole
+    /// full-parse frame to rows.
+    fn column_has_some(col: &crate::second_pass::variants::PropColumn) -> bool {
+        match &col.data {
+            None => false,
+            Some(VarVec::Bool(v)) => v.iter().any(|x| x.is_some()),
+            Some(VarVec::I32(v)) => v.iter().any(|x| x.is_some()),
+            Some(VarVec::F32(v)) => v.iter().any(|x| x.is_some()),
+            Some(VarVec::String(v)) => v.iter().any(|x| x.is_some()),
+            Some(VarVec::U32(v)) => v.iter().any(|x| x.is_some()),
+            Some(VarVec::U64(v)) => v.iter().any(|x| x.is_some()),
+            Some(VarVec::XYVec(v)) => v.iter().any(|x| x.is_some()),
+            Some(VarVec::XYZVec(v)) => v.iter().any(|x| x.is_some()),
+            // Vec-per-row columns always carry a value.
+            _ => true,
+        }
+    }
+
+    fn sorted_canonical(mut rows: Vec<Row>) -> Vec<String> {
+        let mut v: Vec<String> = rows.drain(..).map(|r| canon(&r)).collect();
+        v.sort();
+        v
+    }
+
+    fn key_set(rows: &[Row]) -> BTreeSet<String> {
+        rows.iter().flat_map(|r| r.keys().cloned()).collect()
+    }
+
+    fn tick_of(row: &Row) -> i32 {
+        match row.get("tick") {
+            Some(Some(Variant::I32(t))) => *t,
+            other => panic!("row without tick: {:?}", other),
+        }
+    }
+
+    /// Mid-demo window spanning several segments (~8k ticks, ~80k rows).
+    const R_LO: i32 = 28000;
+    const R_HI: i32 = 36000;
+
+    #[test]
+    fn bounded_surfaces_match_full_parse() {
+        let mmap = load_demo();
+        let huf = create_huffman_lookup_table();
+
+        let rows_full = rows_in_range(&FULL_MT_STD, R_LO, R_HI);
+        assert!(!rows_full.is_empty());
+        let schema = key_set(&rows_full);
+
+        // Singular range.
+        let parser = Parser::new(inputs_for(&huf, &std_props()), crate::parse_demo::ParsingMode::Normal);
+        let range_out = parser.parse_tick_range(&mmap, SHARED_STD.clone(), R_LO, R_HI).unwrap();
+        let rows_range = aos_rows(&range_out);
+
+        // Multi-range (split window exercises bucket routing + concat).
+        let parser = Parser::new(inputs_for(&huf, &std_props()), crate::parse_demo::ParsingMode::Normal);
+        let ranges_out = parser
+            .parse_tick_ranges(&mmap, SHARED_STD.clone(), &[(R_LO, 32000), (32001, R_HI)])
+            .unwrap();
+        assert_eq!(ranges_out.len(), 2);
+        let rows_ranges: Vec<Row> = ranges_out.iter().flat_map(aos_rows).collect();
+
+        // Chunk stream: every chunk, rows filtered to the window.
+        let parser = Parser::new(inputs_for(&huf, &std_props()), crate::parse_demo::ParsingMode::Normal);
+        let mut infos = SHARED_STD.prop_controller.prop_infos.clone();
+        infos.sort_by_key(|x| x.prop_name.clone());
+        let iter = parser.iter_chunks(&mmap, SHARED_STD.clone()).unwrap();
+        let mut rows_chunks: Vec<Row> = vec![];
+        for chunk in iter {
+            let output = chunk.unwrap();
+            let helper = OutputSerdeHelperStruct {
+                prop_infos: infos.clone(),
+                inner: output.df.into(),
+            };
+            rows_chunks.extend(soa_to_aos(helper, false).into_iter().filter(|r| {
+                let t = tick_of(r);
+                t >= R_LO && t <= R_HI
+            }));
+        }
+
+        // Same key schema per row on all four paths...
+        for (label, rows) in [("range", &rows_range), ("ranges", &rows_ranges), ("chunks", &rows_chunks)] {
+            assert!(!rows.is_empty(), "{label} produced no rows");
+            assert_eq!(key_set(rows), schema, "{label} key schema differs from full parse");
+            for row in rows.iter() {
+                assert_eq!(row.keys().len(), schema.len(), "{label} row has ragged keys");
+            }
+        }
+        // ...and row-for-row equal within the range.
+        let full = sorted_canonical(rows_full);
+        assert_eq!(sorted_canonical(rows_range), full, "parse_tick_range differs from full parse");
+        assert_eq!(sorted_canonical(rows_ranges), full, "parse_tick_ranges differs from full parse");
+        assert_eq!(sorted_canonical(rows_chunks), full, "iter_chunks differs from full parse");
+    }
+
+    /// `c4_blow`'s last value lands at tick 52165, so it is null throughout
+    /// the demo tail yet valued elsewhere: a range fully inside the tail
+    /// decodes only segments that never value it (overlap seg 16 plus its
+    /// seg-15 pre-roll), leaving the column untyped — the exact shape that
+    /// used to drop the key. The ranged output must carry the key with
+    /// nulls instead. Regression test for the "materialize null-only range
+    /// columns" review comment.
+    #[test]
+    fn range_carries_null_only_prop_as_nulls() {
+        const N_LO: i32 = 57650;
+        const N_HI: i32 = 57900;
+        let mmap = load_demo();
+        let huf = create_huffman_lookup_table();
+        let wanted = vec!["c4_blow".to_string(), "X".to_string()];
+
+        // Precondition from the full parse: all null inside the window, some
+        // value outside it (otherwise this test proves nothing).
+        let full_rows = rows_in_range(&FULL_ST_WIDE, N_LO, N_HI);
+        assert!(!full_rows.is_empty());
+        for row in &full_rows {
+            assert_eq!(row.get("c4_blow"), Some(&None), "precondition: c4_blow must be null in window");
+        }
+        let c4_id = FULL_ST_WIDE
+            .prop_controller
+            .prop_infos
+            .iter()
+            .find(|p| p.prop_friendly_name == "c4_blow")
+            .expect("c4_blow registered")
+            .id;
+        assert!(
+            column_has_some(&FULL_ST_WIDE.df[&c4_id]),
+            "precondition: c4_blow must be valued somewhere in the demo"
+        );
+
+        let parser = Parser::new(inputs_for(&huf, &wanted), crate::parse_demo::ParsingMode::Normal);
+        let shared = parser.preparse(&mmap).unwrap();
+        let out = parser.parse_tick_range(&mmap, shared, N_LO, N_HI).unwrap();
+        // The column is untyped (or absent) in the ranged decode — the exact
+        // shape that used to drop the key.
+        let untyped = match out.df.get(
+            &out.prop_controller.prop_infos.iter().find(|p| p.prop_friendly_name == "c4_blow").unwrap().id,
+        ) {
+            None => true,
+            Some(col) => col.data.is_none(),
+        };
+        assert!(untyped, "precondition: c4_blow must have no typed column in the ranged decode");
+        let rows = aos_rows(&out);
+        assert_eq!(rows.len(), full_rows.len());
+        for row in &rows {
+            assert_eq!(row.get("c4_blow"), Some(&None), "ranged row drops the null-only key");
+        }
+        // Same keys, same values as the one-shot in the window.
+        let keys: BTreeSet<String> = ["c4_blow", "X", "tick", "steamid", "name"].iter().map(|s| s.to_string()).collect();
+        let project = |rows: Vec<Row>| {
+            rows.into_iter()
+                .map(|r| r.into_iter().filter(|(k, _)| keys.contains(k)).collect::<Row>())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sorted_canonical(project(rows)), sorted_canonical(project(full_rows)));
+    }
+
+    /// `c4_blow`'s first value lands mid-demo (tick 8259): early chunks must
+    /// emit the key as null instead of dropping it. Regression test for the
+    /// template-accumulation bug (already-emitted chunks could never be
+    /// repaired by accumulated templates).
+    #[test]
+    fn chunks_carry_late_first_value_prop_as_nulls_early() {
+        let mmap = load_demo();
+        let huf = create_huffman_lookup_table();
+        let wanted = vec!["c4_blow".to_string(), "X".to_string()];
+
+        let parser = Parser::new(inputs_for(&huf, &wanted), crate::parse_demo::ParsingMode::Normal);
+        let shared = parser.preparse(&mmap).unwrap();
+        let prop_infos = prop_infos_sorted(&FULL_ST_WIDE)
+            .into_iter()
+            .filter(|p| wanted.contains(&p.prop_friendly_name) || ["tick", "steamid", "name"].contains(&p.prop_friendly_name.as_str()))
+            .collect::<Vec<_>>();
+        let mut chunks: Vec<Vec<Row>> = vec![];
+        let mut iter = parser.iter_chunks(&mmap, shared).unwrap();
+        for chunk in &mut iter {
+            let output = chunk.unwrap();
+            let helper = OutputSerdeHelperStruct {
+                prop_infos: prop_infos.clone(),
+                inner: output.df.into(),
+            };
+            chunks.push(soa_to_aos(helper, false));
+        }
+        assert!(chunks.len() > 3, "expected several segments, got {}", chunks.len());
+        let first_valued = chunks
+            .iter()
+            .position(|rows| rows.iter().any(|r| matches!(r.get("c4_blow"), Some(Some(_)))))
+            .expect("c4_blow must be valued in some chunk");
+        // First value lands after the opening segments (tick 8259), so early
+        // chunks are the null-only case.
+        assert!(first_valued >= 2, "expected late first value, got chunk {first_valued}");
+        for (idx, rows) in chunks.iter().enumerate() {
+            for row in rows {
+                assert!(
+                    row.contains_key("c4_blow"),
+                    "chunk {idx} drops the c4_blow key (pre-fix template bug)"
+                );
+                if idx < first_valued {
+                    assert_eq!(row.get("c4_blow"), Some(&None), "chunk {idx} should be all nulls");
+                }
+            }
+        }
+    }
+
+    /// Velocity needs continuous decode: the singular range falls back to a
+    /// continuous decode and matches the full one-shot, while the
+    /// per-segment surfaces reject velocity props with a naming error.
+    #[test]
+    fn velocity_continuous_fallback_and_per_segment_rejection() {
+        let mmap = load_demo();
+        let huf = create_huffman_lookup_table();
+        let wanted = vec!["velocity".to_string(), "velocity_X".to_string(), "X".to_string(), "Y".to_string()];
+
+        // Singular range serves velocity and matches the full parse.
+        let parser = Parser::new(inputs_for(&huf, &wanted), crate::parse_demo::ParsingMode::Normal);
+        let shared = parser.preparse(&mmap).unwrap();
+        let out = parser.parse_tick_range(&mmap, shared, R_LO, R_HI).unwrap();
+        let rows = aos_rows(&out);
+        assert!(!rows.is_empty());
+        let keys: BTreeSet<String> =
+            rows.iter().flat_map(|r| r.keys().cloned()).collect();
+        let full_rows = rows_in_range(&FULL_ST_WIDE, R_LO, R_HI);
+        let project = |rows: Vec<Row>| {
+            rows.into_iter()
+                .map(|r| r.into_iter().filter(|(k, _)| keys.contains(k)).collect::<Row>())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sorted_canonical(project(rows)), sorted_canonical(project(full_rows)));
+
+        // Per-segment surfaces reject with the naming error.
+        let parser = Parser::new(inputs_for(&huf, &wanted), crate::parse_demo::ParsingMode::Normal);
+        let shared = parser.preparse(&mmap).unwrap();
+        match parser.parse_tick_ranges(&mmap, shared, &[(R_LO, R_HI)]) {
+            Err(DemoParserError::NonMultithreadableProps(msg)) => assert!(msg.contains("velocity"), "error must name velocity: {msg}"),
+            other => panic!("expected velocity rejection, got {:?}", other.map(|_| ())),
+        }
+        let parser = Parser::new(inputs_for(&huf, &wanted), crate::parse_demo::ParsingMode::Normal);
+        let shared = parser.preparse(&mmap).unwrap();
+        match parser.iter_chunks(&mmap, shared) {
+            Err(DemoParserError::NonMultithreadableProps(msg)) => assert!(msg.contains("velocity"), "error must name velocity: {msg}"),
+            other => panic!("expected velocity rejection, got {:?}", other.map(|_| ())),
+        }
+    }
+}
