@@ -95,6 +95,21 @@ pub fn segments_for_ticks(shared: &SharedFirstPass, lo: i32, hi: i32) -> std::op
     start..end.min(ticks.len())
 }
 
+/// `segments_for_ticks` plus a one-segment pre-roll: range decoding starts
+/// one snapshot early so rows demuxed around the first in-range fullpacket
+/// are not missed. When `lo` equals a fullpacket tick, tick `lo`'s ordinary
+/// DemPacket is demuxed BEFORE that fullpacket and belongs to the preceding
+/// segment — the raw overlap selection would drop part of tick `lo`'s rows
+/// (the full parse decodes every segment and keeps both parts). The pre-roll
+/// is unconditional rather than gated on `lo` landing on a snapshot tick so
+/// coverage does not depend on demux packet ordering; the extra segment only
+/// ever contributes out-of-range rows, which are trimmed (singular) or routed
+/// away (plural).
+fn segments_for_tick_range(shared: &SharedFirstPass, lo: i32, hi: i32) -> std::ops::Range<usize> {
+    let range = segments_for_ticks(shared, lo, hi);
+    if range.start > 0 { (range.start - 1)..range.end } else { range }
+}
+
 /// Range-agnostic per-segment items routed to overlapping ranges by segment.
 #[derive(Default, Clone)]
 struct MiscBucket {
@@ -303,7 +318,8 @@ impl<'a> Parser<'a> {
         hi: i32,
     ) -> Result<DemoOutput, DemoParserError> {
         let seg_range = segments_for_ticks(&shared, lo, hi);
-        let selected: Vec<usize> = shared.fullpacket_offsets[seg_range.clone()].to_vec();
+        let sel_range = segments_for_tick_range(&shared, lo, hi);
+        let selected: Vec<usize> = shared.fullpacket_offsets[sel_range.clone()].to_vec();
         // Props that accumulate cross-fullpacket state (damage counters,
         // duck/crouch state, ...) reset at every per-segment boundary and
         // would diverge from the full parse. Decode the selected interval
@@ -453,7 +469,7 @@ impl<'a> Parser<'a> {
             sorted.iter().map(|&(lo, hi, _)| (lo, hi)).collect();
         let mut seg_set = std::collections::BTreeSet::new();
         for &(lo, hi, _) in &sorted {
-            seg_set.extend(segments_for_ticks(shared, lo, hi));
+            seg_set.extend(segments_for_tick_range(shared, lo, hi));
         }
         let seg_list: Vec<usize> = seg_set.into_iter().collect();
         let mut decoded: Vec<(usize, RangedBuckets, SecondPassOutput)> = seg_list
