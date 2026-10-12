@@ -2,8 +2,11 @@ use parser::first_pass::parser::SharedFirstPass;
 use parser::first_pass::parser_settings::rm_user_friendly_names;
 use parser::first_pass::parser_settings::FirstPassParser;
 use parser::first_pass::parser_settings::ParserInputs;
+use parser::first_pass::prop_controller::PropInfo;
 use parser::maps::NON_MULTITHREADABLE_PROPS;
+use parser::parse_demo::ChunkTemplates;
 use parser::parse_demo::Parser;
+use parser::parse_demo::normalize_chunk_df;
 use parser::parse_demo::ParsingMode::ForceSingleThreaded;
 use parser::second_pass::parser_settings::create_huffman_lookup_table;
 use parser::second_pass::variants::soa_to_aos;
@@ -567,6 +570,14 @@ struct ChunkParserInner {
     next_idx: usize,
     chunk_count: usize,
     skip_nones: bool,
+    /// `parseTicks`/`parseGrenades`-shaped column list, computed once after
+    /// preparse: temp velocity props (X/Y/Z) filtered out here, not per
+    /// chunk, so chunk rows never leak implementation-only columns.
+    prop_infos: Vec<PropInfo>,
+    /// Accumulated per-prop variant templates for null materialization:
+    /// grows as chunks decode, so a chunk that never materializes a prop
+    /// still emits explicit nulls like the one-shot parse.
+    templates: ChunkTemplates,
 }
 
 #[wasm_bindgen]
@@ -667,6 +678,14 @@ impl ChunkParser {
             Err(e) => return Err(JsError::new(&format!("{}", e))),
         };
         let chunk_count = shared.fullpacket_offsets.len();
+        // Drop implementation-only temp props (X/Y/Z added to compute
+        // velocity) once, mirroring `combine_outputs`, so chunk rows carry
+        // exactly the `parseTicks` columns instead of leaking X/Y/Z.
+        let mut prop_infos = shared.prop_controller.prop_infos.clone();
+        for prop in &shared.added_temp_props {
+            prop_infos.retain(|x| &x.prop_name != prop);
+        }
+        prop_infos.sort_by_key(|x| x.prop_name.clone());
         Ok(ChunkParser {
             inner: Some(ChunkParserInner {
                 file,
@@ -675,6 +694,8 @@ impl ChunkParser {
                 next_idx: 0,
                 chunk_count,
                 skip_nones: if is_grenades { opts.skip_nones.unwrap_or(false) } else { false },
+                prop_infos,
+                templates: ChunkTemplates::default(),
             }),
         })
     }
@@ -705,23 +726,29 @@ impl ChunkParser {
         }
         let idx = inner.next_idx;
         inner.next_idx += 1;
-        // `ChunkIter` owns its snapshot, so hand it a clone. The per-segment
-        // `SecondPassParser::new` clones the same tables again per segment, so
-        // this matches the existing per-chunk clone cost (no asymptotic change).
-        let mut iter = inner.parser.iter_chunks_from(&inner.file, inner.shared.clone(), idx);
-        let segment = match iter.next() {
-            Some(Ok(output)) => output,
-            Some(Err(e)) => return Err(JsError::new(&format!("{}", e))),
-            // Unreachable: `idx` was bounds-checked above, but report cleanly.
-            None => return Ok(JsValue::UNDEFINED),
+        let mut segment = {
+            // `ChunkIter` owns its snapshot, so hand it a clone. The per-segment
+            // `SecondPassParser::new` clones the same tables again per segment, so
+            // this matches the existing per-chunk clone cost (no asymptotic change).
+            let mut iter = match inner.parser.iter_chunks_from(&inner.file, inner.shared.clone(), idx) {
+                Ok(iter) => iter,
+                Err(e) => return Err(JsError::new(&format!("{}", e))),
+            };
+            match iter.next() {
+                Some(Ok(output)) => output,
+                Some(Err(e)) => return Err(JsError::new(&format!("{}", e))),
+                // Unreachable: `idx` was bounds-checked above, but report cleanly.
+                None => return Ok(JsValue::UNDEFINED),
+            }
         };
-        // Same serialization as `parseTickRange`: shared prop infos sorted by
-        // prop name, then struct-of-arrays to array-of-objects. The segment
-        // `df` is the same `AHashMap<u32, PropColumn>` type as `DemoOutput`'s.
-        let mut prop_infos = inner.shared.prop_controller.prop_infos.clone();
-        prop_infos.sort_by_key(|x| x.prop_name.clone());
+        // Same serialization as `parseTickRange`, with the
+        // constructor-filtered prop infos (no temp X/Y/Z leak) and
+        // `None`-only columns materialized to explicit nulls (matching the
+        // `parseTicks`/`parseGrenades` row shape). The segment `df` is the
+        // same `AHashMap<u32, PropColumn>` type as `DemoOutput`'s.
+        normalize_chunk_df(&mut segment.df, &mut inner.templates);
         let helper = OutputSerdeHelperStruct {
-            prop_infos: prop_infos,
+            prop_infos: inner.prop_infos.clone(),
             inner: segment.df.into(),
         };
         let result = soa_to_aos(helper, inner.skip_nones);

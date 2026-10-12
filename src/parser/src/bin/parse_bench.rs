@@ -122,7 +122,7 @@ fn run_once_chunked(mmap: &[u8], huf: &Vec<(u8, u8)>) -> f64 {
     let t = Instant::now();
     let shared = parser.preparse(mmap).expect("preparse");
     let n_segments = shared.fullpacket_offsets.len();
-    let mut it = parser.iter_chunks(mmap, shared);
+    let mut it = parser.iter_chunks(mmap, shared).expect("iter_chunks");
     let mut chunks = vec![];
     for c in &mut it {
         chunks.push(c.expect("chunk"));

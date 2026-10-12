@@ -134,70 +134,104 @@ struct MiscBucket {
 /// valued only outside ALL ranges degrades to a dropped (vs null) column,
 /// matching full-parse representation for that range.
 fn normalize_segment_buckets(rb: &mut RangedBuckets) {
-    fn dummy_for(data: &VarVec) -> Variant {
-        match data {
-            VarVec::Bool(_) => Variant::Bool(false),
-            VarVec::I32(_) => Variant::I32(0),
-            VarVec::F32(_) => Variant::F32(0.0),
-            VarVec::String(_) => Variant::String(String::new()),
-            VarVec::U64(_) => Variant::U64(0),
-            VarVec::U32(_) => Variant::U32(0),
-            VarVec::StringVec(_) => Variant::StringVec(vec![]),
-            VarVec::U64Vec(_) => Variant::U64Vec(vec![]),
-            VarVec::U32Vec(_) => Variant::U32Vec(vec![]),
-            VarVec::XYVec(_) => Variant::VecXY([0.0, 0.0]),
-            VarVec::XYZVec(_) => Variant::VecXYZ([0.0, 0.0, 0.0]),
-            VarVec::Stickers(_) => Variant::Stickers(vec![]),
-            VarVec::InputHistory(_) => Variant::InputHistory(vec![]),
-            VarVec::UserCmdSubtickMoves(_) => Variant::UserCmdSubtickMoves(vec![]),
-        }
-    }
-    fn empty_like(dummy: &Variant, n: usize) -> VarVec {
-        let mut vv = VarVec::new(dummy);
-        for _ in 0..n {
-            vv.push_variant(None);
-        }
-        vv
-    }
-    // Variant template per prop id from any materialized column in the segment.
     let mut templates: AHashMap<u32, Variant> = AHashMap::default();
     for m in rb.dfs.iter() {
-        for (id, col) in m.iter() {
-            if let Some(data) = col.data.as_ref() {
-                templates.entry(*id).or_insert_with(|| dummy_for(data));
-            }
-        }
+        harvest_templates(m, &mut templates);
     }
     for pmap in rb.per_player.iter() {
         for m in pmap.values() {
-            for (id, col) in m.iter() {
-                if let Some(data) = col.data.as_ref() {
-                    templates.entry(*id).or_insert_with(|| dummy_for(data));
-                }
-            }
+            harvest_templates(m, &mut templates);
         }
     }
     if templates.is_empty() {
         return;
     }
-    let mut fix_map = |m: &mut AHashMap<u32, PropColumn>| {
-        for (id, col) in m.iter_mut() {
-            if col.data.is_none() {
-                if let Some(d) = templates.get(id) {
-                    col.data = Some(empty_like(d, col.num_nones));
-                    col.num_nones = 0;
-                }
-            }
-        }
-    };
     for m in rb.dfs.iter_mut() {
-        fix_map(m);
+        materialize_nones(m, &templates);
     }
     for pmap in rb.per_player.iter_mut() {
         for m in pmap.values_mut() {
-            fix_map(m);
+            materialize_nones(m, &templates);
         }
     }
+}
+
+/// Dummy `Variant` matching a materialized `VarVec`'s type, used to build
+/// an all-`None` column of the same type (see `empty_like` and
+/// `normalize_chunk_df`). Shared with `normalize_segment_buckets` so both
+/// paths agree on the materialized representation.
+fn dummy_for(data: &VarVec) -> Variant {
+    match data {
+        VarVec::Bool(_) => Variant::Bool(false),
+        VarVec::I32(_) => Variant::I32(0),
+        VarVec::F32(_) => Variant::F32(0.0),
+        VarVec::String(_) => Variant::String(String::new()),
+        VarVec::U64(_) => Variant::U64(0),
+        VarVec::U32(_) => Variant::U32(0),
+        VarVec::StringVec(_) => Variant::StringVec(vec![]),
+        VarVec::U64Vec(_) => Variant::U64Vec(vec![]),
+        VarVec::U32Vec(_) => Variant::U32Vec(vec![]),
+        VarVec::XYVec(_) => Variant::VecXY([0.0, 0.0]),
+        VarVec::XYZVec(_) => Variant::VecXYZ([0.0, 0.0, 0.0]),
+        VarVec::Stickers(_) => Variant::Stickers(vec![]),
+        VarVec::InputHistory(_) => Variant::InputHistory(vec![]),
+        VarVec::UserCmdSubtickMoves(_) => Variant::UserCmdSubtickMoves(vec![]),
+    }
+}
+
+fn empty_like(dummy: &Variant, n: usize) -> VarVec {
+    let mut vv = VarVec::new(dummy);
+    for _ in 0..n {
+        vv.push_variant(None);
+    }
+    vv
+}
+
+/// Per-prop-id variant template from every materialized column in `map`.
+/// First materialized column wins (a prop id always decodes to one type).
+fn harvest_templates(map: &AHashMap<u32, PropColumn>, templates: &mut AHashMap<u32, Variant>) {
+    for (id, col) in map.iter() {
+        if let Some(data) = col.data.as_ref() {
+            templates.entry(*id).or_insert_with(|| dummy_for(data));
+        }
+    }
+}
+
+fn materialize_nones(m: &mut AHashMap<u32, PropColumn>, templates: &AHashMap<u32, Variant>) {
+    for (id, col) in m.iter_mut() {
+        if col.data.is_none() {
+            if let Some(d) = templates.get(id) {
+                col.data = Some(empty_like(d, col.num_nones));
+                col.num_nones = 0;
+            }
+        }
+    }
+}
+
+/// Accumulated per-prop-id variant templates for chunk serialization (see
+/// `normalize_chunk_df`). Kept opaque so the wasm crate never names the
+/// map type; one handle accumulates across its `nextChunk` calls.
+#[derive(Default)]
+pub struct ChunkTemplates {
+    inner: AHashMap<u32, Variant>,
+}
+
+/// Streaming twin of `normalize_segment_buckets` for one chunk `df`:
+/// harvest templates from the chunk's materialized columns into
+/// `templates`, then materialize the chunk's `None`-only columns that
+/// have a template into explicit-null columns of the chunk's row length,
+/// so `soa_to_aos` emits nulls instead of dropping the keys.
+///
+/// Templates accumulate across chunks because a single segment may never
+/// materialize a prop (e.g. a chunk with projectile rows but no inferno
+/// rows) that neighboring segments do; without the accumulated template
+/// those keys would be dropped while the full parse emits nulls. Residual
+/// edge (same as the ranged path): a prop with no template in any
+/// decoded-so-far chunk degrades to a dropped column, matching
+/// full-parse representation for an all-`None` column.
+pub fn normalize_chunk_df(df: &mut AHashMap<u32, PropColumn>, templates: &mut ChunkTemplates) {
+    harvest_templates(df, &mut templates.inner);
+    materialize_nones(df, &templates.inner);
 }
 
 /// Tick span covered by segment `seg_idx`: `[tick_i, tick_{i+1})`, last runs
@@ -290,7 +324,12 @@ impl<'a> Parser<'a> {
     /// order. Each chunk is self-contained (snapshot init at its fullpacket),
     /// so callers can process and drop chunks one at a time to bound peak
     /// memory instead of merging the whole demo via `combine_chunks`.
-    pub fn iter_chunks<'b>(&'b self, demo_bytes: &'b [u8], shared: SharedFirstPass) -> ChunkIter<'a, 'b> {
+    ///
+    /// Rejects non-multithreadable props (damage counters, duck state, ...):
+    /// per-segment decode cannot carry their cross-segment state, so
+    /// streaming them would return silently-reset values. Use
+    /// `parse_tick_range` or the full `parse_demo` for those props.
+    pub fn iter_chunks<'b>(&'b self, demo_bytes: &'b [u8], shared: SharedFirstPass) -> Result<ChunkIter<'a, 'b>, DemoParserError> {
         self.iter_chunks_from(demo_bytes, shared, 0)
     }
     /// Same as `iter_chunks` but resumes at segment `start_idx` (an index
@@ -298,13 +337,24 @@ impl<'a> Parser<'a> {
     /// handle persists its cursor across `nextChunk` calls and resumes here,
     /// so each segment is decoded exactly once. An out-of-range `start_idx`
     /// simply yields an empty iterator.
-    pub fn iter_chunks_from<'b>(&'b self, demo_bytes: &'b [u8], shared: SharedFirstPass, start_idx: usize) -> ChunkIter<'a, 'b> {
-        ChunkIter {
+    pub fn iter_chunks_from<'b>(
+        &'b self,
+        demo_bytes: &'b [u8],
+        shared: SharedFirstPass,
+        start_idx: usize,
+    ) -> Result<ChunkIter<'a, 'b>, DemoParserError> {
+        if !check_multithreadability(&self.input.wanted_player_props) {
+            return Err(DemoParserError::NonMultithreadableProps(format!(
+                "iter_chunks cannot serve non-multithreadable props {:?}: per-segment decode cannot carry their state across segments; use parse_tick_range or parse_demo instead",
+                non_multithreadable_requested(&self.input.wanted_player_props)
+            )));
+        }
+        Ok(ChunkIter {
             shared,
             inputs: &self.input,
             bytes: demo_bytes,
             next_idx: start_idx,
-        }
+        })
     }
     /// Parse only the segments overlapping tick range `[lo, hi]` and trim
     /// rows/events outside it. Segment decode is byte-identical to the full
