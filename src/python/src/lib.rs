@@ -125,6 +125,40 @@ fn column_is_empty(data: &Option<VarVec>) -> bool {
     }
 }
 
+/// Row count used to size null-filled columns (see `push_null_column`): the
+/// tick column always exists (`PropController` unconditionally registers
+/// tick/steamid/name), so an absent/untyped requested column is padded to its
+/// length. Falls back to the longest present column when tick itself is
+/// missing (e.g. a range that decoded zero rows).
+fn df_row_count(
+    df: &AHashMap<u32, parser::second_pass::variants::PropColumn>,
+    prop_infos: &[parser::first_pass::prop_controller::PropInfo],
+) -> usize {
+    if let Some(tick) = prop_infos.iter().find(|p| p.prop_name == "tick") {
+        if let Some(col) = df.get(&tick.id) {
+            return col.len();
+        }
+    }
+    df.values().map(|c| c.len()).max().unwrap_or(0)
+}
+
+/// Push an all-null column for a requested prop whose decoded column is
+/// absent or untyped (`data: None`), so ranged outputs keep the same shape
+/// as the full parse (which emits such columns null-filled) instead of
+/// silently dropping the key. DTYPE NUANCE: an all-null series is untyped
+/// (NaN/object downstream) where the full parse's column may carry a dtype;
+/// column PRESENCE is what this promises, not dtype parity.
+fn push_null_column(
+    df_column_names_arrow: &mut Vec<String>,
+    friendly_name: &str,
+    n_rows: usize,
+) -> PyResult<Py<PyAny>> {
+    let nulls: Vec<Option<i32>> = vec![None; n_rows];
+    let s = Series::new(friendly_name, nulls);
+    df_column_names_arrow.push(friendly_name.to_string());
+    rust_series_to_py_series(&s)
+}
+
 #[pymethods]
 impl DemoParser {
     #[new]
@@ -299,6 +333,8 @@ impl DemoParser {
         let prop_infos = output.prop_controller.prop_infos;
         let mut df_column_names_arrow = vec![];
         let mut df_column_names_py = vec![];
+        // Tick-column row count sizing null-filled columns (see `push_null_column`).
+        let n_rows = df_row_count(&output.df, &prop_infos);
 
         for prop_info in prop_infos {
             if output.df.contains_key(&prop_info.id) {
@@ -348,8 +384,27 @@ impl DemoParser {
                         df_column_names_py.push(prop_info.prop_friendly_name);
                         all_pyobjects.push(data.into_py_any(py)?);
                     }
-                    _ => {}
+                    // Typed but unhandled shape (e.g. XYVec): preserve the existing drop.
+                    Some(_) => {}
+                    // Untyped (`data: None`) column: null-fill to keep
+                    // range/full shape parity (see `push_null_column`).
+                    None => {
+                        all_series.push(push_null_column(
+                            &mut df_column_names_arrow,
+                            &prop_info.prop_friendly_name,
+                            n_rows,
+                        )?);
+                    }
                 }
+            } else if !skip_nones {
+                // Requested prop with no decoded column at all (only when no
+                // rows were collected): same null-fill; skipped when the
+                // caller asked to drop empty columns.
+                all_series.push(push_null_column(
+                    &mut df_column_names_arrow,
+                    &prop_info.prop_friendly_name,
+                    n_rows,
+                )?);
             }
         }
         Python::attach(|py| {
@@ -829,6 +884,8 @@ impl DemoParser {
         let prop_infos = output.prop_controller.prop_infos;
         let mut df_column_names_arrow = vec![];
         let mut df_column_names_py = vec![];
+        // Tick-column row count sizing null-filled columns (see `push_null_column`).
+        let n_rows = df_row_count(&output.df, &prop_infos);
 
         for prop_info in prop_infos {
             if output.df.contains_key(&prop_info.id) {
@@ -941,8 +998,26 @@ impl DemoParser {
                         df_column_names_py.push(prop_info.prop_friendly_name);
                         all_pyobjects.push(dicts.into_py_any(py)?);
                     }
-                    _ => {}
+                    // Typed but unhandled shape (e.g. XYVec): preserve the existing drop.
+                    Some(_) => {}
+                    // Untyped (`data: None`) column: null-fill to keep
+                    // range/full shape parity (see `push_null_column`).
+                    None => {
+                        all_series.push(push_null_column(
+                            &mut df_column_names_arrow,
+                            &prop_info.prop_friendly_name,
+                            n_rows,
+                        )?);
+                    }
                 }
+            } else {
+                // Requested prop with no decoded column at all (only when no
+                // rows were collected): same null-fill as above.
+                all_series.push(push_null_column(
+                    &mut df_column_names_arrow,
+                    &prop_info.prop_friendly_name,
+                    n_rows,
+                )?);
             }
         }
         Python::attach(|py| {
@@ -1025,6 +1100,8 @@ impl DemoParser {
         let prop_infos = output.prop_controller.prop_infos;
         let mut df_column_names_arrow = vec![];
         let mut df_column_names_py = vec![];
+        // Tick-column row count sizing null-filled columns (see `push_null_column`).
+        let n_rows = df_row_count(&output.df, &prop_infos);
 
         for prop_info in prop_infos {
             if output.df.contains_key(&prop_info.id) {
@@ -1137,8 +1214,26 @@ impl DemoParser {
                         df_column_names_py.push(prop_info.prop_friendly_name);
                         all_pyobjects.push(dicts.into_py_any(py)?);
                     }
-                    _ => {}
+                    // Typed but unhandled shape (e.g. XYVec): preserve the existing drop.
+                    Some(_) => {}
+                    // Untyped (`data: None`) column: null-fill to keep
+                    // range/full shape parity (see `push_null_column`).
+                    None => {
+                        all_series.push(push_null_column(
+                            &mut df_column_names_arrow,
+                            &prop_info.prop_friendly_name,
+                            n_rows,
+                        )?);
+                    }
                 }
+            } else {
+                // Requested prop with no decoded column at all (only when no
+                // rows were collected): same null-fill as above.
+                all_series.push(push_null_column(
+                    &mut df_column_names_arrow,
+                    &prop_info.prop_friendly_name,
+                    n_rows,
+                )?);
             }
         }
         Python::attach(|py| {

@@ -18662,4 +18662,152 @@ mod parity_tests {
             other => panic!("expected velocity rejection, got {:?}", other.map(|_| ())),
         }
     }
+
+    /// Like `inputs_for` but also collects `wanted_events`: lets range tests
+    /// assert the in-range EVENT slice matches the full parse's slice (the
+    /// continuous path decodes prefix events for state and must retain only
+    /// the in-range ones).
+    fn inputs_for_with_events<'a>(huf: &'a Vec<(u8, u8)>, wanted: &[String], events: &[String]) -> ParserInputs<'a> {
+        let real = rm_user_friendly_names(&wanted.to_vec()).unwrap();
+        let mut og = AHashMap::default();
+        for (r, f) in real.iter().zip(wanted) {
+            og.insert(r.clone(), f.clone());
+        }
+        ParserInputs {
+            wanted_players: vec![],
+            real_name_to_og_name: og,
+            wanted_player_props: real,
+            wanted_other_props: vec![],
+            wanted_events: events.to_vec(),
+            collect_ticks: true,
+            parse_voice: false,
+            parse_ents: true,
+            wanted_ticks: vec![],
+            parse_projectiles: false,
+            parse_grenades: false,
+            grenade_classes: None,
+            only_header: false,
+            list_props: false,
+            only_convars: false,
+            huffman_lookup_table: huf,
+            order_by_steamid: false,
+            wanted_prop_states: AHashMap::default(),
+            fallback_bytes: None,
+        }
+    }
+
+    fn event_slice(out: &DemoOutput, lo: i32, hi: i32) -> Vec<String> {
+        out.game_events
+            .iter()
+            .filter(|e| e.tick >= lo && e.tick <= hi)
+            .map(|e| format!("{:?}@{}", e.fields, e.tick))
+            .collect()
+    }
+
+    /// Stateful props accumulate across the whole demo and a fullpacket
+    /// snapshot does not restore them: `m_iDamage`'s last update before
+    /// `[DMG_LO, DMG_HI]` predates the pre-roll segment, so starting the
+    /// continuous decode one segment early begins the range with reset
+    /// state (`None` where the full parse holds `Some(0)`). Decoding the
+    /// demo prefix from byte 16 with row suppression must reproduce the
+    /// full single-threaded slice row-for-row including values. Fails
+    /// pre-fix (range-start state was reset).
+    const DMG_LO: i32 = 15500;
+    const DMG_HI: i32 = 16300;
+
+    #[test]
+    fn continuous_stateful_prop_matches_full_parse() {
+        let dmg =
+            "CCSPlayerController.CCSPlayerController_ActionTrackingServices.m_iDamage".to_string();
+        let wanted = vec![dmg, "X".to_string()];
+        let events = vec!["player_death".to_string()];
+        let mmap = load_demo();
+        let huf = create_huffman_lookup_table();
+
+        // Full single-threaded reference with the SAME inputs (same keys, so
+        // no projection is needed for a row-for-row comparison).
+        let mut full_parser = Parser::new(
+            inputs_for_with_events(&huf, &wanted, &events),
+            crate::parse_demo::ParsingMode::ForceSingleThreaded,
+        );
+        let full = full_parser.parse_demo(&mmap).unwrap();
+        let full_rows = rows_in_range(&full, DMG_LO, DMG_HI);
+        assert!(!full_rows.is_empty());
+        let full_evts = event_slice(&full, DMG_LO, DMG_HI);
+
+        let parser = Parser::new(
+            inputs_for_with_events(&huf, &wanted, &events),
+            crate::parse_demo::ParsingMode::Normal,
+        );
+        let shared = parser.preparse(&mmap).unwrap();
+        let out = parser.parse_tick_range(&mmap, shared, DMG_LO, DMG_HI).unwrap();
+        let rows = aos_rows(&out);
+
+        // Row suppression: the output row count equals the in-range slice
+        // count — no prefix rows leak (catches routing failures).
+        assert_eq!(
+            rows.len(),
+            full_rows.len(),
+            "continuous range row count differs from in-range slice: prefix rows leaked or rows lost"
+        );
+        // Row-for-row including values.
+        assert_eq!(
+            sorted_canonical(rows),
+            sorted_canonical(full_rows),
+            "parse_tick_range with stateful prop differs from full parse"
+        );
+        // The in-range event slice matches the full parse's slice (prefix
+        // events decoded for state must not leak).
+        assert_eq!(event_slice(&out, DMG_LO, DMG_HI), full_evts, "range event slice differs from full parse slice");
+        for e in &out.game_events {
+            assert!(e.tick >= DMG_LO && e.tick <= DMG_HI, "out-of-range event leaked: {} @ {}", e.name, e.tick);
+        }
+    }
+
+    /// `velocity_X` over the standard mid-demo window: velocity history now
+    /// accumulates from the demo start while prefix rows are suppressed, so
+    /// the range matches the full single-threaded parse row-for-row
+    /// including values. Guards the routing path: if suppressed prefix ticks
+    /// failed to advance velocity history, in-range velocity would be
+    /// `None`/stale here.
+    #[test]
+    fn continuous_velocity_matches_full_parse() {
+        let wanted = vec!["velocity_X".to_string(), "X".to_string()];
+        let events = vec!["player_death".to_string()];
+        let mmap = load_demo();
+        let huf = create_huffman_lookup_table();
+
+        let mut full_parser = Parser::new(
+            inputs_for_with_events(&huf, &wanted, &events),
+            crate::parse_demo::ParsingMode::ForceSingleThreaded,
+        );
+        let full = full_parser.parse_demo(&mmap).unwrap();
+        let full_rows = rows_in_range(&full, R_LO, R_HI);
+        assert!(!full_rows.is_empty());
+        let full_evts = event_slice(&full, R_LO, R_HI);
+
+        let parser = Parser::new(
+            inputs_for_with_events(&huf, &wanted, &events),
+            crate::parse_demo::ParsingMode::Normal,
+        );
+        let shared = parser.preparse(&mmap).unwrap();
+        let out = parser.parse_tick_range(&mmap, shared, R_LO, R_HI).unwrap();
+        let rows = aos_rows(&out);
+
+        // Row suppression: no prefix rows leak (catches routing failures).
+        assert_eq!(
+            rows.len(),
+            full_rows.len(),
+            "continuous range row count differs from in-range slice: prefix rows leaked or rows lost"
+        );
+        assert_eq!(
+            sorted_canonical(rows),
+            sorted_canonical(full_rows),
+            "parse_tick_range with velocity_X differs from full parse"
+        );
+        assert_eq!(event_slice(&out, R_LO, R_HI), full_evts, "range event slice differs from full parse slice");
+        for e in &out.game_events {
+            assert!(e.tick >= R_LO && e.tick <= R_HI, "out-of-range event leaked: {} @ {}", e.name, e.tick);
+        }
+    }
 }

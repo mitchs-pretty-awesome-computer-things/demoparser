@@ -2,7 +2,6 @@ use crate::first_pass::frameparser::{FrameParser, StartEndOffset, StartEndType};
 use crate::first_pass::parser::SharedFirstPass;
 use crate::first_pass::parser_settings::check_multithreadability;
 use crate::first_pass::parser_settings::continuous_decode_required;
-use crate::first_pass::parser_settings::needs_velocity;
 use crate::first_pass::parser_settings::{FirstPassParser, ParserInputs};
 use crate::first_pass::prop_controller::{PropController, NAME_ID, STEAMID_ID, TICK_ID};
 use crate::first_pass::read_bits::DemoParserError;
@@ -339,15 +338,29 @@ impl<'a> Parser<'a> {
             next_idx: start_idx,
         })
     }
-    /// Parse only the segments overlapping tick range `[lo, hi]` and trim
-    /// rows/events outside it. Segment decode is byte-identical to the full
-    /// parse by construction (same per-segment path); out-of-range rows from
-    /// the boundary segments are dropped after merging.
+    /// Parse only the tick range `[lo, hi]` and drop rows/events outside
+    /// it. Two decode strategies, chosen by prop kind:
+    ///
+    /// - Per-segment-safe props: only the overlapping segments (plus a
+    ///   one-segment pre-roll for boundary-tick coverage) are decoded.
+    ///   Segment decode is byte-identical to the full parse by construction
+    ///   (same per-segment path); out-of-range rows from the boundary
+    ///   segments are dropped after merging.
+    /// - Props that require a continuous decode (see
+    ///   `continuous_decode_required`: cross-segment state such as damage
+    ///   counters, plus velocity-derived props): the DEMO PREFIX is decoded
+    ///   continuously from `HEADER_ENDS_AT_BYTE` up to the end of the last
+    ///   selected segment. Stateful props accumulate across the whole demo
+    ///   and a fullpacket snapshot does not restore them, so starting at the
+    ///   range would begin with reset state and diverge from the full
+    ///   single-threaded parse. Cost is ~ the full single-threaded parse up
+    ///   to the range end; that is inherent to correctness, not overhead —
+    ///   only per-segment-safe props get the bounded decode.
     ///
     /// Unlike the per-segment surfaces (`parse_tick_ranges`, `iter_chunks`,
-    /// `ChunkParser`), this serves props that require a continuous decode —
-    /// cross-segment state and velocity-derived props — via the continuous
-    /// fallback below, so velocity here matches the full one-shot parse.
+    /// `ChunkParser`), this serves continuous-decode props via the prefix
+    /// fallback (`parse_tick_range_continuous`), so velocity and stateful
+    /// props here match the full one-shot parse.
     ///
     /// SoA-only caveat (see `normalize_segment_buckets`): row outputs
     /// carry every requested key as nulls when never valued in range, but
@@ -360,55 +373,16 @@ impl<'a> Parser<'a> {
         lo: i32,
         hi: i32,
     ) -> Result<DemoOutput, DemoParserError> {
-        let seg_range = segments_for_ticks(&shared, lo, hi);
+        // `continuous_decode_required` is exactly the union of the two old
+        // conditions (`!check_multithreadability` for NON_MULTITHREADABLE
+        // state props, `needs_velocity` for `contains("velo")` props), so
+        // this branch serves the same queries the old fallback did.
+        if !continuous_decode_required(&self.input.wanted_player_props).is_empty() {
+            return self.parse_tick_range_continuous(demo_bytes, shared, lo, hi);
+        }
         let sel_range = segments_for_tick_range(&shared, lo, hi);
         let selected: Vec<usize> = shared.fullpacket_offsets[sel_range.clone()].to_vec();
-        // Props that accumulate cross-fullpacket state (damage counters,
-        // duck/crouch state, ...) reset at every per-segment boundary and
-        // would diverge from the full parse. Velocity-derived props have
-        // the same problem: their two-sample position history restarts at
-        // each segment head. Decode the selected interval CONTINUOUSLY
-        // instead: one parser from the first selected
-        // fullpacket, bounded to the end of the last selected segment (the
-        // next fullpacket offset, or EOF). Bound construction mirrors
-        // `second_pass_threaded_with_channels`; the first fullpacket seeds
-        // entity state from the snapshot and later ones apply as deltas (see
-        // `parse_full_packet_and_break_if_needed`), exactly like the
-        // continuous full parse.
-        let mut outputs: Vec<SecondPassOutput> = if !check_multithreadability(&self.input.wanted_player_props)
-            || needs_velocity(&self.input.wanted_player_props)
-        {
-            if selected.is_empty() {
-                vec![]
-            } else {
-                // Start one fullpacket BEFORE the first selected segment (or
-                // at byte 16 when it is included): frame ticks can plateau
-                // across a segment boundary, so in-range rows may physically
-                // sit just before the first selected fullpacket — notably
-                // around demo start, where tick-1 rows precede the first
-                // tick-1 fullpacket. Frame ticks are monotonic, so one
-                // segment back always covers them; the extra decode is
-                // trimmed away below.
-                let start = if seg_range.start <= 1 {
-                    HEADER_ENDS_AT_BYTE
-                } else {
-                    shared.fullpacket_offsets[seg_range.start - 1]
-                };
-                let end = shared
-                    .fullpacket_offsets
-                    .get(seg_range.end)
-                    .copied()
-                    .unwrap_or(demo_bytes.len());
-                let bound = StartEndOffset {
-                    start,
-                    end,
-                    msg_type: StartEndType::OK,
-                };
-                let mut parser = SecondPassParser::new(&shared, &self.input, start, false, Some(bound))?;
-                parser.start(demo_bytes)?;
-                vec![parser.create_output()]
-            }
-        } else {
+        let mut outputs: Vec<SecondPassOutput> = {
             // WASM has no threads: rayon would have nowhere to run, so parse
             // segments serially there. Native keeps the parallel segment parse.
             #[cfg(target_arch = "wasm32")]
@@ -438,6 +412,120 @@ impl<'a> Parser<'a> {
         Parser::remove_item_sold_events(&mut out.game_events);
         trim_to_tick_range(&mut out, lo, hi);
         Ok(out)
+    }
+    /// Continuous fallback for props that require a demo-prefix decode
+    /// (cross-segment state and velocity-derived props): one parser runs
+    /// from the DEMO START (`HEADER_ENDS_AT_BYTE`, mirroring
+    /// `second_pass_single_threaded`'s `SecondPassParser::new(&shared,
+    /// &self.input, 16, true, None)`) to the end of the last selected
+    /// segment (the next fullpacket offset, or EOF).
+    ///
+    /// The byte-16 start takes the no-seed path in
+    /// `parse_full_packet_and_break_if_needed` (`start ==
+    /// HEADER_ENDS_AT_BYTE` skips snapshot seeding): signon frames already
+    /// built that state live, exactly like the continuous full parse, so the
+    /// seed-once delta handling composes without change.
+    ///
+    /// MEMORY: decoding the prefix without suppression would accumulate the
+    /// whole prefix in `df`, defeating the bounded API. Prefix rows are
+    /// suppressed during decode with range routing
+    /// (`set_range_routing(vec![(lo, hi)])`): rows outside the range
+    /// early-return in `collect_entities_ranged` while entity state AND
+    /// velocity history still advance, so the in-range slice matches the
+    /// full parse. Buckets are drained with `take_range_buckets()` and
+    /// assembled via the shared `assemble_ranged_output` (no duplicated
+    /// assembly logic with `parse_tick_ranges_inner`).
+    fn parse_tick_range_continuous(
+        &self,
+        demo_bytes: &[u8],
+        shared: SharedFirstPass,
+        lo: i32,
+        hi: i32,
+    ) -> Result<DemoOutput, DemoParserError> {
+        let seg_range = segments_for_ticks(&shared, lo, hi);
+        let end = shared
+            .fullpacket_offsets
+            .get(seg_range.end)
+            .copied()
+            .unwrap_or(demo_bytes.len());
+        let bound = StartEndOffset {
+            start: HEADER_ENDS_AT_BYTE,
+            end,
+            msg_type: StartEndType::OK,
+        };
+        let mut parser = SecondPassParser::new(&shared, &self.input, HEADER_ENDS_AT_BYTE, false, Some(bound))?;
+        parser.set_range_routing(vec![(lo, hi)]);
+        parser.start(demo_bytes)?;
+        let mut buckets = parser.take_range_buckets().unwrap_or_default();
+        let mut out = parser.create_output();
+        // Same lazy-None normalization as the multi-range path (no-op for a
+        // single in-range bucket, kept so both paths agree by construction).
+        normalize_segment_buckets(&mut buckets);
+        // The single bucket's maps arrive in `bounds` order; with one range
+        // that is just `dfs[0]` / `per_player[0]`. Moves only (rows were
+        // pushed into buckets during decode).
+        let mut df_parts = Vec::new();
+        if let Some(dfmap) = buckets.dfs.into_iter().next() {
+            if !dfmap.is_empty() {
+                df_parts.push(dfmap);
+            }
+        }
+        let mut pp_parts: AHashMap<u64, Vec<AHashMap<u32, PropColumn>>> = AHashMap::default();
+        if let Some(pmap) = buckets.per_player.into_iter().next() {
+            for (steamid, pmap) in pmap {
+                if !pmap.is_empty() {
+                    pp_parts.entry(steamid).or_default().push(pmap);
+                }
+            }
+        }
+        // Defensive: row collection normally routes everything into buckets,
+        // leaving `out.df`/`out.df_per_player` empty, but the projectile path
+        // (`collect_projectiles`) bypasses routing and pushes straight into
+        // `out.df`. Carry any such rows along; the `trim_to_tick_range` below
+        // bounds them to `[lo, hi]`.
+        if !out.df.is_empty() {
+            df_parts.push(std::mem::take(&mut out.df));
+        }
+        for (steamid, pmap) in std::mem::take(&mut out.df_per_player) {
+            if !pmap.is_empty() {
+                pp_parts.entry(steamid).or_default().push(pmap);
+            }
+        }
+        // Event post-processing mirrors the full parse, then the in-range
+        // slice is retained so the prefix events decoded for state do not leak.
+        Parser::remove_duplicate_player_connects(&mut out.game_events);
+        Parser::add_item_purchase_sell_column(&mut out.game_events);
+        Parser::remove_item_sold_events(&mut out.game_events);
+        out.game_events.retain(|e| e.tick >= lo && e.tick <= hi);
+        // Tick-carrying misc is filtered to the range. The remaining misc
+        // (skins, item drops, chat, convars, end-of-match/player metadata,
+        // live roster, event-name set, seen-prop list) carries no tick and is
+        // range-agnostic: with a byte-16 start it spans the whole prefix, a
+        // SUPERSET of what the old segment-bounded fallback returned. Kept
+        // whole to match `trim_to_tick_range` semantics (which likewise keeps
+        // misc whole); bindings ignore these fields entirely.
+        out.projectiles
+            .retain(|p| p.tick.map(|t| t >= lo && t <= hi).unwrap_or(true));
+        out.voice_data.retain(|(tick, _)| *tick >= lo && *tick <= hi);
+        let misc = MiscBucket {
+            skins: std::mem::take(&mut out.skins),
+            item_drops: std::mem::take(&mut out.item_drops),
+            chat_messages: std::mem::take(&mut out.chat_messages),
+            convars: std::mem::take(&mut out.convars),
+            player_md: std::mem::take(&mut out.player_md),
+            roster: std::mem::take(&mut out.roster),
+            projectiles: std::mem::take(&mut out.projectiles),
+            voice_data: std::mem::take(&mut out.voice_data),
+            game_events_counter: std::mem::take(&mut out.game_events_counter),
+            uniq_prop_names: std::mem::take(&mut out.uniq_prop_names).into_iter().collect(),
+        };
+        let mut assembled =
+            self.assemble_ranged_output(&shared, df_parts, pp_parts, misc, std::mem::take(&mut out.game_events));
+        // Backstop on the same tested path as every other bounded surface:
+        // no-op when routing suppressed correctly, bounds anything the
+        // defensive carry-along above may have contributed.
+        trim_to_tick_range(&mut assembled, lo, hi);
+        Ok(assembled)
     }
     /// Parse many tick ranges in ONE pass: every overlapping segment is
     /// decoded exactly once, rows/events are routed to range buckets, and
@@ -610,48 +698,68 @@ impl<'a> Parser<'a> {
         // columns never valued in the decoded segments.
         let mut results: Vec<DemoOutput> = Vec::with_capacity(n);
         for orig in 0..n {
-            let mut prop_controller = shared.prop_controller.clone();
-            for prop in &shared.added_temp_props {
-                prop_controller.wanted_player_props.retain(|x| x != prop);
-                prop_controller.prop_infos.retain(|x| &x.prop_name != prop);
-            }
-            let df = self.combine_dfs(std::mem::take(&mut df_buckets[orig]), false);
-            let mut pp = AHashMap::default();
-            for (steamid, v) in std::mem::take(&mut pp_buckets[orig]) {
-                pp.insert(steamid, self.combine_dfs(v, true));
-            }
-            let m = &misc[orig];
-            let mut roster_by_sid: std::collections::BTreeMap<u64, PlayerEndMetaData> =
-                std::collections::BTreeMap::new();
-            for p in &m.roster {
-                if let Some(sid) = p.steamid {
-                    if sid != 0 {
-                        roster_by_sid.insert(sid, p.clone());
-                    }
-                }
-            }
-            let mut all_prop_names: Vec<String> = m.uniq_prop_names.iter().cloned().collect();
-            all_prop_names.sort();
-            all_prop_names.dedup();
-            results.push(DemoOutput {
-                prop_controller,
-                chat_messages: m.chat_messages.clone(),
-                item_drops: m.item_drops.clone(),
-                player_md: m.player_md.clone(),
-                roster: roster_by_sid.into_values().collect(),
-                game_events: std::mem::take(&mut events_per_range[orig]),
-                skins: m.skins.clone(),
-                convars: m.convars.clone(),
-                df,
-                header: Some(shared.header.clone()),
-                game_events_counter: m.game_events_counter.clone(),
-                projectiles: m.projectiles.clone(),
-                voice_data: m.voice_data.clone(),
-                df_per_player: pp,
-                uniq_prop_names: all_prop_names,
-            });
+            results.push(self.assemble_ranged_output(
+                shared,
+                std::mem::take(&mut df_buckets[orig]),
+                std::mem::take(&mut pp_buckets[orig]),
+                std::mem::take(&mut misc[orig]),
+                std::mem::take(&mut events_per_range[orig]),
+            ));
         }
         Ok(results)
+    }
+    /// Shared bucket-to-output assembly for the ranged surfaces: combine one
+    /// range's routed row parts, attach its range-agnostic items and its
+    /// already-post-processed in-range events. Used by
+    /// `parse_tick_ranges_inner` (per range) and the singular
+    /// `parse_tick_range_continuous` so the two cannot drift apart.
+    fn assemble_ranged_output(
+        &self,
+        shared: &SharedFirstPass,
+        df_parts: Vec<AHashMap<u32, PropColumn>>,
+        pp_parts: AHashMap<u64, Vec<AHashMap<u32, PropColumn>>>,
+        misc: MiscBucket,
+        events: Vec<GameEvent>,
+    ) -> DemoOutput {
+        let mut prop_controller = shared.prop_controller.clone();
+        for prop in &shared.added_temp_props {
+            prop_controller.wanted_player_props.retain(|x| x != prop);
+            prop_controller.prop_infos.retain(|x| &x.prop_name != prop);
+        }
+        let df = self.combine_dfs(df_parts, false);
+        let mut pp = AHashMap::default();
+        for (steamid, v) in pp_parts {
+            pp.insert(steamid, self.combine_dfs(v, true));
+        }
+        let mut roster_by_sid: std::collections::BTreeMap<u64, PlayerEndMetaData> =
+            std::collections::BTreeMap::new();
+        for p in &misc.roster {
+            if let Some(sid) = p.steamid {
+                if sid != 0 {
+                    roster_by_sid.insert(sid, p.clone());
+                }
+            }
+        }
+        let mut all_prop_names: Vec<String> = misc.uniq_prop_names.iter().cloned().collect();
+        all_prop_names.sort();
+        all_prop_names.dedup();
+        DemoOutput {
+            prop_controller,
+            chat_messages: misc.chat_messages,
+            item_drops: misc.item_drops,
+            player_md: misc.player_md,
+            roster: roster_by_sid.into_values().collect(),
+            game_events: events,
+            skins: misc.skins,
+            convars: misc.convars,
+            df,
+            header: Some(shared.header.clone()),
+            game_events_counter: misc.game_events_counter,
+            projectiles: misc.projectiles,
+            voice_data: misc.voice_data,
+            df_per_player: pp,
+            uniq_prop_names: all_prop_names,
+        }
     }
     /// Merge per-segment outputs into one `DemoOutput` (the multi-threaded
     /// tail: per-prop parallel concat). Prefer streaming chunks via
