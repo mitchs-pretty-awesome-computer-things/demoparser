@@ -18283,7 +18283,7 @@ mod parity_tests {
     use ahash::AHashMap;
     use lazy_static::lazy_static;
     use memmap2::MmapOptions;
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::fs::File;
 
     type Row = HashMap<String, Option<Variant>>;
@@ -18331,6 +18331,14 @@ mod parity_tests {
             wanted_prop_states: AHashMap::default(),
             fallback_bytes: None,
         }
+    }
+
+    /// Like `inputs_for` but with rows bucketed per player (`df_per_player`
+    /// instead of `df`).
+    fn inputs_for_steamid<'a>(huf: &'a Vec<(u8, u8)>, wanted: &[String]) -> ParserInputs<'a> {
+        let mut inputs = inputs_for(huf, wanted);
+        inputs.order_by_steamid = true;
+        inputs
     }
 
     fn load_demo() -> memmap2::Mmap {
@@ -18913,5 +18921,189 @@ mod parity_tests {
             sorted_canonical(single_rows),
             "dual-listed output differs row-for-row from single-list reference"
         );
+    }
+
+    /// Grouped batching must be a pure scheduling dial: overlapping ranges
+    /// return row-for-row what ungrouped `parse_tick_ranges` returns, at
+    /// every batch size, with overlap ticks owned solely by the first range
+    /// (sorted by `lo`). Pre-fix the inner applied first-match-wins only
+    /// within its own chunk, so `batch_size = 1` duplicated the overlap
+    /// into both outputs. Regression test for that review comment.
+    #[test]
+    fn grouped_batching_matches_ungrouped_overlapping_ranges() {
+        const A_LO: i32 = R_LO;
+        const A_HI: i32 = 32000;
+        const B_LO: i32 = 30000;
+        const B_HI: i32 = 34000;
+        let ranges = [(A_LO, A_HI), (B_LO, B_HI)];
+        let mmap = load_demo();
+        let huf = create_huffman_lookup_table();
+        let mk = || Parser::new(inputs_for(&huf, &std_props()), crate::parse_demo::ParsingMode::Normal);
+
+        // Reference: ungrouped multi-range (first-match-wins across both).
+        let ungrouped = mk().parse_tick_ranges(&mmap, SHARED_STD.clone(), &ranges).unwrap();
+        assert_eq!(ungrouped.len(), 2);
+        let ref_rows: Vec<Vec<String>> = ungrouped.iter().map(aos_rows).map(sorted_canonical).collect();
+        assert!(!ref_rows[0].is_empty() && !ref_rows[1].is_empty());
+
+        // Ownership on the reference (the documented rule): ticks in the
+        // shared window live only in the first range's output.
+        let ticks_of = |out: &DemoOutput| -> BTreeSet<i32> { aos_rows(out).iter().map(tick_of).collect() };
+        let ticks0 = ticks_of(&ungrouped[0]);
+        let ticks1 = ticks_of(&ungrouped[1]);
+        let overlap: Vec<i32> = (B_LO..=A_HI).filter(|t| ticks0.contains(t)).collect();
+        assert!(overlap.len() > 500, "expected a wide owned overlap, got {}", overlap.len());
+        assert!(
+            overlap.iter().all(|t| !ticks1.contains(t)),
+            "ungrouped reference leaks overlap ticks into the second range"
+        );
+        assert!(ticks1.iter().any(|t| *t > A_HI), "second range owns no ticks past the overlap");
+
+        // Batch-size invariance: batch 1, 2, and all-ranges must each match
+        // the reference per range, with the overlap solely in the first.
+        // (`wanted_events` is empty here, so per-group event post-proc has
+        // nothing to split; rows are the compared surface.)
+        for batch in [1usize, 2, ranges.len()] {
+            let grouped = mk()
+                .parse_tick_ranges_grouped(&mmap, SHARED_STD.clone(), &ranges, batch)
+                .unwrap();
+            assert_eq!(grouped.len(), 2, "batch={batch}: must yield one output per range");
+            for (i, out) in grouped.iter().enumerate() {
+                assert_eq!(
+                    sorted_canonical(aos_rows(out)),
+                    ref_rows[i],
+                    "batch={batch}: range {i} differs from ungrouped"
+                );
+                let ticks = ticks_of(out);
+                if i == 0 {
+                    assert!(
+                        overlap.iter().all(|t| ticks.contains(t)),
+                        "batch={batch}: first range lost overlap ticks"
+                    );
+                } else {
+                    assert!(
+                        overlap.iter().all(|t| !ticks.contains(t)),
+                        "batch={batch}: overlap ticks duplicated into second range"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Per-player rows of `out` as canonical row strings keyed by steamid.
+    fn pp_rows_by_steamid(
+        out: &DemoOutput,
+        infos: &[crate::first_pass::prop_controller::PropInfo],
+    ) -> BTreeMap<u64, Vec<String>> {
+        let mut map = BTreeMap::new();
+        for (sid, pmap) in out.df_per_player.iter() {
+            let helper = OutputSerdeHelperStruct {
+                prop_infos: infos.to_vec(),
+                inner: pmap.clone().into(),
+            };
+            map.insert(*sid, sorted_canonical(soa_to_aos(helper, false)));
+        }
+        map
+    }
+
+    /// Per-player twin of `rows_in_range`: each player's columns are sliced
+    /// to `[lo, hi]` first, so only the tested window materializes.
+    fn pp_slice_by_steamid(
+        out: &DemoOutput,
+        lo: i32,
+        hi: i32,
+        infos: &[crate::first_pass::prop_controller::PropInfo],
+    ) -> BTreeMap<u64, Vec<String>> {
+        let mut map = BTreeMap::new();
+        for (sid, pmap) in out.df_per_player.iter() {
+            let wanted: Vec<usize> = match pmap.get(&TICK_ID).and_then(|c| c.data.as_ref()) {
+                Some(VarVec::I32(ticks)) => ticks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, t)| match t {
+                        Some(t) if *t >= lo && *t <= hi => Some(idx),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => panic!("tick column missing for player {sid}"),
+            };
+            let mut trimmed = AHashMap::default();
+            for (k, v) in pmap.iter() {
+                if let Some(new) = v.slice_to_new(&wanted) {
+                    trimmed.insert(*k, new);
+                }
+            }
+            let helper = OutputSerdeHelperStruct {
+                prop_infos: infos.to_vec(),
+                inner: trimmed.into(),
+            };
+            map.insert(*sid, sorted_canonical(soa_to_aos(helper, false)));
+        }
+        map
+    }
+
+    /// Plural ranges with `order_by_steamid`: per-player buckets must match
+    /// the full parse's in-range slice row-for-row, carry every player, and
+    /// contain no out-of-range ticks. Closes the last untested corner of the
+    /// earlier per-player trim fix (expected to pass already — coverage for
+    /// the existing fix, not a regression).
+    #[test]
+    fn plural_order_by_steamid_matches_full_parse_slice() {
+        let mmap = load_demo();
+        let huf = create_huffman_lookup_table();
+        let ranges = [(R_LO, 32000), (32001, R_HI)];
+
+        let mut full_parser = Parser::new(
+            inputs_for_steamid(&huf, &std_props()),
+            crate::parse_demo::ParsingMode::Normal,
+        );
+        let full = full_parser.parse_demo(&mmap).unwrap();
+        assert!(full.df.is_empty(), "order_by_steamid rows must live in per-player buckets");
+        let infos = prop_infos_sorted(&full);
+        let full_pp = pp_slice_by_steamid(&full, R_LO, R_HI, &infos);
+        assert!(!full_pp.is_empty(), "reference slice has no players");
+        assert!(full_pp.values().map(Vec::len).sum::<usize>() > 0, "reference slice has no rows");
+
+        let parser = Parser::new(
+            inputs_for_steamid(&huf, &std_props()),
+            crate::parse_demo::ParsingMode::Normal,
+        );
+        let shared = parser.preparse(&mmap).unwrap();
+        let outs = parser.parse_tick_ranges(&mmap, shared, &ranges).unwrap();
+        assert_eq!(outs.len(), 2);
+        // No out-of-range ticks in any per-player bucket.
+        for (i, out) in outs.iter().enumerate() {
+            assert!(out.df.is_empty(), "range {i}: rows must live in per-player buckets");
+            let (lo, hi) = ranges[i];
+            for (sid, pmap) in out.df_per_player.iter() {
+                match pmap.get(&TICK_ID).and_then(|c| c.data.as_ref()) {
+                    Some(VarVec::I32(ticks)) => {
+                        for t in ticks.iter().flatten() {
+                            assert!(*t >= lo && *t <= hi, "range {i} player {sid}: out-of-range tick {t}");
+                        }
+                    }
+                    _ => panic!("range {i} player {sid}: tick column missing"),
+                }
+            }
+        }
+        // Concatenated per-player buckets equal the full slice.
+        let mut ranged_pp: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+        for out in &outs {
+            for (sid, rows) in pp_rows_by_steamid(out, &infos) {
+                ranged_pp.entry(sid).or_default().extend(rows);
+            }
+        }
+        for rows in ranged_pp.values_mut() {
+            rows.sort();
+        }
+        ranged_pp.retain(|_, rows| !rows.is_empty());
+        let mut full_cmp = full_pp;
+        full_cmp.retain(|_, rows| !rows.is_empty());
+        assert_eq!(
+            ranged_pp.keys().collect::<Vec<_>>(),
+            full_cmp.keys().collect::<Vec<_>>(),
+            "per-player buckets incomplete"
+        );
+        assert_eq!(ranged_pp, full_cmp, "plural order_by_steamid differs from full parse slice");
     }
 }

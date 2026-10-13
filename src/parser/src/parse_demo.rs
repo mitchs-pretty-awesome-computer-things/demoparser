@@ -288,6 +288,44 @@ pub enum ParsingMode {
     Normal,
 }
 
+/// Owned (effective) interval per range: global first-match-wins over the
+/// FULL range list, so batching cannot change returned rows. Stable-sorts
+/// indices by `lo` (input order wins equal `lo` — the same tie-break
+/// `parse_tick_ranges_inner`'s `sorted.sort_by_key` uses), then each range
+/// owns `[lo, hi]` minus the union of earlier ranges' intervals. Because
+/// every earlier range starts at or before `lo`, that remainder is always a
+/// single suffix `[owned_lo, hi]` (or empty when fully shadowed); tracking
+/// one running `max_hi` is exact. Non-overlapping ranges keep
+/// `owned_lo == lo`, so effective == requested and segment selection and
+/// routing are unchanged for them.
+fn effective_intervals(ranges: &[(i32, i32)]) -> Vec<(i32, i32)> {
+    let mut order: Vec<usize> = (0..ranges.len()).collect();
+    order.sort_by_key(|&i| ranges[i].0);
+    // Fully-shadowed ranges route no rows (`tick >= lo && tick <= hi` never
+    // holds) and no misc (`lo < span.1` never holds, even for the trailing
+    // `i32::MAX`-capped segment span). Selects only the last segment(s) for
+    // decode via `segments_for_ticks` (partition_point saturates, `end` is
+    // clamped to at least `start + 1`), so it flows through the inner safely.
+    const EMPTY: (i32, i32) = (i32::MAX, i32::MIN);
+    let mut eff = vec![EMPTY; ranges.len()];
+    // `i64` so `max_hi + 1` cannot overflow when a range ends at `i32::MAX`.
+    let mut max_hi: i64 = i64::MIN;
+    for i in order {
+        let (lo, hi) = ranges[i];
+        let owned_lo = (lo as i64).max(max_hi + 1);
+        if owned_lo <= hi as i64 {
+            eff[i] = (owned_lo as i32, hi);
+            max_hi = max_hi.max(hi as i64);
+        } else {
+            // Shadowed: `[lo, hi]` is already covered by earlier ranges, so
+            // it adds no coverage — `max_hi` stays (including it would be a
+            // no-op on the union, since it lies inside earlier coverage).
+            eff[i] = EMPTY;
+        }
+    }
+    eff
+}
+
 impl<'a> Parser<'a> {
     pub fn new(input: ParserInputs<'a>, parsing_mode: ParsingMode) -> Self {
         Parser {
@@ -554,6 +592,22 @@ impl<'a> Parser<'a> {
     /// once. Event post-proc is per-group, so cross-group sell matching
     /// falls back to range-local semantics at group edges (documented).
     ///
+    /// Ownership is computed GLOBALLY before grouping (see
+    /// `effective_intervals`): each group decodes its ranges' owned
+    /// intervals, so the batching dial is purely a scheduling detail and
+    /// cannot change the returned rows — outputs are identical for any
+    /// `batch_size`. Two consequences of decoding owned (not requested)
+    /// intervals per group, both cosmetic-or-CPU only:
+    /// (a) range-agnostic misc (skins/chat/voice — bindings ignore these)
+    /// routes by effective bounds here, a subtle distribution shift versus
+    /// ungrouped `parse_tick_ranges`, which routes misc by requested
+    /// bounds; (b) a segment needed by two groups is re-decoded once per
+    /// group (CPU only, outputs identical).
+    ///
+    /// Every input range still yields exactly one output in input order;
+    /// fully-shadowed ranges produce empty outputs (they are NOT dropped —
+    /// callers index outputs by range).
+    ///
     /// Like `parse_tick_ranges`, rejects props that require a continuous
     /// decode (cross-segment state or velocity-derived props).
     pub fn parse_tick_ranges_grouped(
@@ -563,8 +617,9 @@ impl<'a> Parser<'a> {
         ranges: &[(i32, i32)],
         batch_size: usize,
     ) -> Result<Vec<DemoOutput>, DemoParserError> {
+        let effective = effective_intervals(ranges);
         let mut out = Vec::with_capacity(ranges.len());
-        for chunk in ranges.chunks(batch_size.max(1)) {
+        for chunk in effective.chunks(batch_size.max(1)) {
             out.extend(self.parse_tick_ranges_inner(demo_bytes, &shared, chunk)?);
         }
         Ok(out)
