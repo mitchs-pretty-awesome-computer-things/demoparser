@@ -443,6 +443,11 @@ impl PropController {
             // one entry. Two entries share one id-keyed output column and
             // would interleave double rows (misaligned against every other
             // column). Player entry wins when dual-listed.
+            // The branches below are mutually exclusive (`else if`) on purpose:
+            // `already` is computed once before the first push, so it cannot
+            // see the player entry just pushed — a second `if !already` would
+            // still hold and push a duplicate other entry for a dual-listed
+            // prop within this same call.
             let already = self.prop_infos.iter().any(|p| p.id == f.prop_id as u32);
             if !already && self.wanted_player_props.contains(&prop_name.to_string()) {
                 self.prop_infos.push(PropInfo {
@@ -456,8 +461,7 @@ impl PropController {
                         .to_string(),
                     is_player_prop: true,
                 });
-            }
-            if !already
+            } else if !already
                 && self
                     .wanted_other_props
                     .contains(&prop_name.to_string())

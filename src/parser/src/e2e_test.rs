@@ -18810,4 +18810,108 @@ mod parity_tests {
             assert!(e.tick >= R_LO && e.tick <= R_HI, "out-of-range event leaked: {} @ {}", e.name, e.tick);
         }
     }
+
+    /// Like `inputs_for` but with an explicit split between player and other
+    /// props, so a prop can be listed in one list or in both.
+    fn inputs_split<'a>(huf: &'a Vec<(u8, u8)>, player: &[String], other: &[String]) -> ParserInputs<'a> {
+        let real_player = rm_user_friendly_names(&player.to_vec()).unwrap();
+        let real_other = rm_user_friendly_names(&other.to_vec()).unwrap();
+        let mut og = AHashMap::default();
+        for (r, f) in real_player.iter().zip(player.iter()) {
+            og.insert(r.clone(), f.clone());
+        }
+        for (r, f) in real_other.iter().zip(other.iter()) {
+            og.insert(r.clone(), f.clone());
+        }
+        ParserInputs {
+            wanted_players: vec![],
+            real_name_to_og_name: og,
+            wanted_player_props: real_player,
+            wanted_other_props: real_other,
+            wanted_events: vec![],
+            collect_ticks: true,
+            parse_voice: false,
+            parse_ents: true,
+            wanted_ticks: vec![],
+            parse_projectiles: false,
+            parse_grenades: false,
+            grenade_classes: None,
+            only_header: false,
+            list_props: false,
+            only_convars: false,
+            huffman_lookup_table: huf,
+            order_by_steamid: false,
+            wanted_prop_states: AHashMap::default(),
+            fallback_bytes: None,
+        }
+    }
+
+    /// A prop listed in BOTH `wanted_player_props` and `wanted_other_props`
+    /// must yield exactly one `PropInfo` (player entry wins) and output
+    /// identical to listing it in exactly one list. Pre-fix the second
+    /// insertion branch re-checked a stale `already` flag computed before the
+    /// first push, so a dual-listed prop got two entries sharing one
+    /// id-keyed output column, doubling that column's rows and misaligning it
+    /// against every other column.
+    #[test]
+    fn dual_listed_prop_yields_single_entry_and_identical_output() {
+        let prop = "CCSGameRulesProxy.CCSGameRules.m_iRoundTime".to_string();
+        let mmap = load_demo();
+        let huf = create_huffman_lookup_table();
+
+        // Reference: the prop listed in exactly one list (player).
+        let mut single_parser = Parser::new(
+            inputs_split(&huf, &[prop.clone()], &[]),
+            crate::parse_demo::ParsingMode::ForceSingleThreaded,
+        );
+        let single = single_parser.parse_demo(&mmap).unwrap();
+        // Same prop listed in both lists.
+        let mut dual_parser = Parser::new(
+            inputs_split(&huf, &[prop.clone()], &[prop.clone()]),
+            crate::parse_demo::ParsingMode::ForceSingleThreaded,
+        );
+        let dual = dual_parser.parse_demo(&mmap).unwrap();
+
+        // The reference registers the prop exactly once; resolve its id.
+        let single_entries: Vec<_> = single
+            .prop_controller
+            .prop_infos
+            .iter()
+            .filter(|p| p.prop_name == prop)
+            .collect();
+        assert_eq!(single_entries.len(), 1, "reference must register the prop once");
+        let prop_id = single_entries[0].id;
+        // Precondition: the prop is actually valued somewhere in the demo
+        // (otherwise the row comparison below would prove nothing).
+        let single_col = single.df.get(&prop_id).expect("reference column present");
+        assert!(column_has_some(single_col), "precondition: m_iRoundTime must be valued somewhere in the demo");
+
+        // Dual-listed: exactly one entry for that id, and the player entry wins.
+        let dual_entries: Vec<_> = dual.prop_controller.prop_infos.iter().filter(|p| p.id == prop_id).collect();
+        assert_eq!(
+            dual_entries.len(),
+            1,
+            "dual-listed prop must yield exactly one PropInfo (got {}): duplicate id-keyed entries double the output column",
+            dual_entries.len()
+        );
+        assert!(dual_entries[0].is_player_prop, "player entry must win when dual-listed");
+        assert_eq!(dual_entries[0], single_entries[0], "dual-listed entry must equal the single-list entry");
+
+        // Same key schema and row-for-row identical output.
+        let single_rows = aos_rows(&single);
+        let dual_rows = aos_rows(&dual);
+        assert!(!single_rows.is_empty(), "reference produced no rows");
+        assert_eq!(key_set(&dual_rows), key_set(&single_rows), "dual-listed key schema differs from single-list reference");
+        let dual_col = dual.df.get(&prop_id).expect("dual-listed column present");
+        assert_eq!(
+            dual_col.len(),
+            single_col.len(),
+            "dual-listed column row count differs from single-list reference (doubled column)"
+        );
+        assert_eq!(
+            sorted_canonical(dual_rows),
+            sorted_canonical(single_rows),
+            "dual-listed output differs row-for-row from single-list reference"
+        );
+    }
 }
