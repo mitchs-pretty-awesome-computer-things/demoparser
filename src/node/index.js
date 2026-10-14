@@ -252,6 +252,9 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
+// Export-parity guard: `node check-exports.mjs` fails if any name
+// destructured here is missing from a tracked `.node` binding — re-run it
+// (and rebuild the binaries) after adding/removing a `#[napi]` export.
 const { JsVariant, WantedPropState, parseVoice, listGameEvents, parseGrenades, parseHeader, parseEvent, parseEvents, parseTicks, parseTickRange, parsePlayerInfo, parsePlayerSkins, listUpdatedFields } = nativeBinding
 
 module.exports.JsVariant = JsVariant

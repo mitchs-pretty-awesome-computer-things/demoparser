@@ -19042,6 +19042,91 @@ mod parity_tests {
         map
     }
 
+    /// Like `inputs_for` but collects grenade/projectile rows instead of
+    /// player rows (mirrors the `parse_grenades` binding settings).
+    fn inputs_for_projectiles<'a>(huf: &'a Vec<(u8, u8)>, extra: &[String]) -> ParserInputs<'a> {
+        let real = rm_user_friendly_names(&extra.to_vec()).unwrap();
+        let mut og = AHashMap::default();
+        for (r, f) in real.iter().zip(extra) {
+            og.insert(r.clone(), f.clone());
+        }
+        ParserInputs {
+            wanted_players: vec![],
+            real_name_to_og_name: og,
+            wanted_player_props: vec![],
+            wanted_other_props: real,
+            wanted_events: vec![],
+            collect_ticks: true,
+            parse_voice: false,
+            parse_ents: true,
+            wanted_ticks: vec![],
+            parse_projectiles: true,
+            parse_grenades: true,
+            grenade_classes: None,
+            only_header: false,
+            list_props: false,
+            only_convars: false,
+            huffman_lookup_table: huf,
+            order_by_steamid: false,
+            wanted_prop_states: AHashMap::default(),
+            fallback_bytes: None,
+        }
+    }
+
+    /// Plural ranges with `parse_projectiles`: grenade rows bypass bucket
+    /// routing (`collect_projectiles` writes straight into the segment
+    /// output), so the plural assembly must carry them into the owning
+    /// range. Concatenated plural rows — and the singular range slice —
+    /// must equal the full parse's slice row-for-row. Fails pre-fix
+    /// (every plural range has an empty `df`).
+    #[test]
+    fn plural_projectiles_match_full_parse_slice() {
+        let ranges = [(R_LO, 32000), (32001, R_HI)];
+        let mmap = load_demo();
+        let huf = create_huffman_lookup_table();
+        let extra: Vec<String> = vec![];
+
+        let mut full_parser = Parser::new(
+            inputs_for_projectiles(&huf, &extra),
+            crate::parse_demo::ParsingMode::Normal,
+        );
+        let full = full_parser.parse_demo(&mmap).unwrap();
+        let full_slices: Vec<Vec<Row>> =
+            ranges.iter().map(|&(lo, hi)| rows_in_range(&full, lo, hi)).collect();
+        for (i, rows) in full_slices.iter().enumerate() {
+            assert!(!rows.is_empty(), "precondition: range {i} has no grenade rows in the full parse");
+        }
+        let full_all = sorted_canonical(full_slices.into_iter().flatten().collect());
+
+        let parser = Parser::new(
+            inputs_for_projectiles(&huf, &extra),
+            crate::parse_demo::ParsingMode::Normal,
+        );
+        let shared = parser.preparse(&mmap).unwrap();
+        let outs = parser.parse_tick_ranges(&mmap, shared, &ranges).unwrap();
+        assert_eq!(outs.len(), ranges.len());
+        let ranged_rows: Vec<Row> = outs.iter().flat_map(aos_rows).collect();
+        assert_eq!(
+            sorted_canonical(ranged_rows),
+            full_all,
+            "parse_tick_ranges with projectiles differs from full parse slice"
+        );
+
+        // Singular parity: the plural range output must match the singular
+        // `parse_tick_range` slice for the same range.
+        let parser = Parser::new(
+            inputs_for_projectiles(&huf, &extra),
+            crate::parse_demo::ParsingMode::Normal,
+        );
+        let shared = parser.preparse(&mmap).unwrap();
+        let singular = parser.parse_tick_range(&mmap, shared, ranges[0].0, ranges[0].1).unwrap();
+        assert_eq!(
+            sorted_canonical(aos_rows(&singular)),
+            sorted_canonical(aos_rows(&outs[0])),
+            "plural range differs from singular parse_tick_range for the same range"
+        );
+    }
+
     /// Plural ranges with `order_by_steamid`: per-player buckets must match
     /// the full parse's in-range slice row-for-row, carry every player, and
     /// contain no out-of-range ticks. Closes the last untested corner of the

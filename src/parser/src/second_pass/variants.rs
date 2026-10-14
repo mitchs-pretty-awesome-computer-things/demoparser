@@ -887,65 +887,77 @@ impl Serialize for OutputSerdeHelperStruct {
         let mut map = serializer.serialize_map(Some(self.prop_infos.len()))?;
 
         for prop_info in &self.prop_infos {
-            if self.inner.contains_key(&prop_info.id) {
-                match &self.inner[&prop_info.id].data {
-                    None => {}
-                    Some(VarVec::F32(val)) => {
-                        map.serialize_entry(&prop_info.prop_friendly_name, val)?;
-                    }
-                    Some(VarVec::I32(val)) => {
-                        map.serialize_entry(&prop_info.prop_friendly_name, val)?;
-                    }
-                    Some(VarVec::String(val)) => {
-                        map.serialize_entry(&prop_info.prop_friendly_name, val)?;
-                    }
-                    Some(VarVec::U64(val)) => {
-                        let as_str: Vec<Option<String>> = val
-                            .iter()
-                            .map(|x| match x {
-                                Some(u) => Some(u.to_string()),
-                                None => None,
-                            })
-                            .collect_vec();
-                        map.serialize_entry(&prop_info.prop_friendly_name, &as_str)?;
-                    }
-                    Some(VarVec::Bool(val)) => {
-                        map.serialize_entry(&prop_info.prop_friendly_name, val)?;
-                    }
-                    Some(VarVec::U32(val)) => {
-                        map.serialize_entry(&prop_info.prop_friendly_name, val)?;
-                    }
-                    Some(VarVec::StringVec(val)) => {
-                        map.serialize_entry(&prop_info.prop_friendly_name, val)?;
-                    }
-                    Some(VarVec::U32Vec(val)) => {
-                        map.serialize_entry(&prop_info.prop_friendly_name, val)?;
-                    }
-                    Some(VarVec::XYVec(val)) => {
-                        map.serialize_entry(&prop_info.prop_friendly_name, val)?;
-                    }
-                    Some(VarVec::XYZVec(val)) => {
-                        map.serialize_entry(&prop_info.prop_friendly_name, val)?;
-                    }
-                    Some(VarVec::Stickers(val)) => {
-                        map.serialize_entry(&prop_info.prop_friendly_name, val)?;
-                    }
-                    Some(VarVec::InputHistory(val)) => {
-                        map.serialize_entry(&prop_info.prop_friendly_name, val)?;
-                    }
-                    Some(VarVec::UserCmdSubtickMoves(val)) => {
-                        map.serialize_entry(&prop_info.prop_friendly_name, val)?;
-                    }
-                    Some(VarVec::U64Vec(val)) => {
-                        let string_sid = val
-                            .iter()
-                            .map(|v| {
-                                let as_sid = v.iter().map(|s| s.to_string()).collect_vec();
-                                as_sid
-                            })
-                            .collect_vec();
-                        map.serialize_entry(&prop_info.prop_friendly_name, &string_sid)?;
-                    }
+            // Absent columns (never pushed in this decode) and untyped
+            // (`data: None`) columns (pushed but never valued): the prop was
+            // requested but has no values here. Emit an explicit null so
+            // bounded SoA outputs keep key parity with the full parse, which
+            // materializes a null-filled array for the same prop.
+            //
+            // Invariant: every requested prop emits exactly one entry — key
+            // presence (shape parity) is the guarantee; the value is `null`
+            // where the full parse emits a null-filled array. Full-path
+            // outputs are unchanged: their columns are always materialized,
+            // so this arm is unreachable there.
+            let col = self.inner.get(&prop_info.id).and_then(|c| c.data.as_ref());
+            match col {
+                None => {
+                    map.serialize_entry(&prop_info.prop_friendly_name, &Option::<Vec<Option<Variant>>>::None)?;
+                }
+                Some(VarVec::F32(val)) => {
+                    map.serialize_entry(&prop_info.prop_friendly_name, val)?;
+                }
+                Some(VarVec::I32(val)) => {
+                    map.serialize_entry(&prop_info.prop_friendly_name, val)?;
+                }
+                Some(VarVec::String(val)) => {
+                    map.serialize_entry(&prop_info.prop_friendly_name, val)?;
+                }
+                Some(VarVec::U64(val)) => {
+                    let as_str: Vec<Option<String>> = val
+                        .iter()
+                        .map(|x| match x {
+                            Some(u) => Some(u.to_string()),
+                            None => None,
+                        })
+                        .collect_vec();
+                    map.serialize_entry(&prop_info.prop_friendly_name, &as_str)?;
+                }
+                Some(VarVec::Bool(val)) => {
+                    map.serialize_entry(&prop_info.prop_friendly_name, val)?;
+                }
+                Some(VarVec::U32(val)) => {
+                    map.serialize_entry(&prop_info.prop_friendly_name, val)?;
+                }
+                Some(VarVec::StringVec(val)) => {
+                    map.serialize_entry(&prop_info.prop_friendly_name, val)?;
+                }
+                Some(VarVec::U32Vec(val)) => {
+                    map.serialize_entry(&prop_info.prop_friendly_name, val)?;
+                }
+                Some(VarVec::XYVec(val)) => {
+                    map.serialize_entry(&prop_info.prop_friendly_name, val)?;
+                }
+                Some(VarVec::XYZVec(val)) => {
+                    map.serialize_entry(&prop_info.prop_friendly_name, val)?;
+                }
+                Some(VarVec::Stickers(val)) => {
+                    map.serialize_entry(&prop_info.prop_friendly_name, val)?;
+                }
+                Some(VarVec::InputHistory(val)) => {
+                    map.serialize_entry(&prop_info.prop_friendly_name, val)?;
+                }
+                Some(VarVec::UserCmdSubtickMoves(val)) => {
+                    map.serialize_entry(&prop_info.prop_friendly_name, val)?;
+                }
+                Some(VarVec::U64Vec(val)) => {
+                    let string_sid = val
+                        .iter()
+                        .map(|v| {
+                            let as_sid = v.iter().map(|s| s.to_string()).collect_vec();
+                            as_sid
+                        })
+                        .collect_vec();
+                    map.serialize_entry(&prop_info.prop_friendly_name, &string_sid)?;
                 }
             }
         }
@@ -1032,5 +1044,35 @@ mod tests {
             assert!(!row.contains_key("untyped"));
             assert!(!row.contains_key("absent"));
         }
+    }
+
+    /// Bounded SoA serialization must keep key parity with the full parse:
+    /// a typed column holds its values while a `data: None` column and a
+    /// prop with no column at all each emit an explicit JSON `null`
+    /// (not a dropped key). Fails pre-fix (both were skipped).
+    fn soa_null_parity_helper() -> OutputSerdeHelperStruct {
+        let mut inner = HashMap::default();
+        inner.insert(
+            1,
+            PropColumn {
+                data: Some(VarVec::I32(vec![Some(1), None])),
+                num_nones: 0,
+            },
+        );
+        inner.insert(2, PropColumn { data: None, num_nones: 2 });
+        OutputSerdeHelperStruct {
+            prop_infos: vec![prop_info(1, "typed"), prop_info(2, "untyped"), prop_info(3, "absent")],
+            inner,
+        }
+    }
+
+    #[test]
+    fn soa_serializer_emits_nulls_for_unvalued_props() {
+        let v = serde_json::to_value(soa_null_parity_helper()).unwrap();
+        let map = v.as_object().expect("SoA serializes as a map");
+        assert_eq!(map.len(), 3, "every requested prop must emit exactly one entry: {map:?}");
+        assert_eq!(map["typed"], serde_json::json!([1, null]));
+        assert_eq!(map["untyped"], serde_json::Value::Null);
+        assert_eq!(map["absent"], serde_json::Value::Null);
     }
 }

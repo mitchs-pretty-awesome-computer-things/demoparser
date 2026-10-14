@@ -134,12 +134,14 @@ struct MiscBucket {
 /// valued only outside ALL ranges degrades to a dropped (vs null) column,
 /// matching full-parse representation for that range.
 ///
-/// SoA-only residual (documented, not fixed): row (AoS) outputs always
-/// carry every requested key — `soa_to_aos` emits untyped nulls without
-/// needing a type — but `structOfArrays` serialization omits columns with
-/// no typed values, so a prop valued only outside the decoded ranges is
-/// absent from a bounded SoA map while the full parse emits a null-filled
-/// column. This was investigated and deliberately left: a prop id's
+/// SoA shape parity (see `OutputSerdeHelperStruct`'s `Serialize` impl):
+/// row (AoS) outputs always carry every requested key — `soa_to_aos`
+/// emits untyped nulls without needing a type — and `structOfArrays`
+/// serialization emits an explicit `null` for columns with no typed
+/// values, so a prop valued only outside the decoded ranges is still
+/// present as a key while the full parse emits a null-filled array there.
+/// A per-type registry that could emit a null-filled TYPED array instead
+/// of `null` was investigated and deliberately left out: a prop id's
 /// `Variant` type cannot be derived cleanly from sendtable metadata.
 /// `PropInfo` carries only `PropType` (Player/Weapon/Custom/...), and the
 /// column type is decided post-decode in the second pass (`find_prop`
@@ -281,6 +283,64 @@ fn trim_to_tick_range(out: &mut DemoOutput, lo: i32, hi: i32) {
     }
     out.game_events.retain(|e| e.tick >= lo && e.tick <= hi);
 }
+/// Owning range (original index) for `tick` under first-match-wins over
+/// `sorted` (ascending `lo`): the same rule the row routing
+/// (`collect_entities_ranged`) uses. `None` when no range covers the tick.
+fn owner_of(sorted: &[(i32, i32, usize)], tick: i32) -> Option<usize> {
+    for &(lo, hi, orig) in sorted {
+        if tick < lo {
+            break;
+        }
+        if tick <= hi {
+            return Some(orig);
+        }
+    }
+    None
+}
+/// Partition one segment's UNROUTED rows into per-range parts, keyed by
+/// original range index. `collect_projectiles` bypasses range routing and
+/// writes grenade rows straight into the segment output map, so without
+/// this the plural assembly would drop them. Ownership is the same
+/// first-match-wins over `sorted` the routing uses (see `owner_of`), and
+/// columns are sliced with `PropColumn::slice_to_new` (the
+/// `trim_to_tick_range` pattern) — so every row producer (player rows via
+/// buckets, projectile rows via this carry-along) lands in exactly one
+/// range's output, already bounded to its range.
+///
+/// Rows with no owning range (the pre-roll segment's out-of-range ticks)
+/// are dropped. A missing or untyped tick column carries nothing: no
+/// panic, no misassignment (in practice the tick column is always present
+/// whenever such rows exist).
+fn partition_unrouted_by_tick(
+    df: &AHashMap<u32, PropColumn>,
+    sorted: &[(i32, i32, usize)],
+) -> Vec<(usize, AHashMap<u32, PropColumn>)> {
+    let ticks = match df.get(&TICK_ID).and_then(|c| c.data.as_ref()) {
+        Some(VarVec::I32(t)) => t,
+        _ => return Vec::new(),
+    };
+    let mut per_range: AHashMap<usize, Vec<usize>> = AHashMap::default();
+    for (idx, t) in ticks.iter().enumerate() {
+        if let Some(t) = t {
+            if let Some(orig) = owner_of(sorted, *t) {
+                per_range.entry(orig).or_default().push(idx);
+            }
+        }
+    }
+    let mut parts = Vec::with_capacity(per_range.len());
+    for (orig, wanted) in per_range {
+        let mut part = AHashMap::default();
+        for (k, v) in df.iter() {
+            if let Some(new) = v.slice_to_new(&wanted) {
+                part.insert(*k, new);
+            }
+        }
+        if !part.is_empty() {
+            parts.push((orig, part));
+        }
+    }
+    parts
+}
 #[derive(PartialEq)]
 pub enum ParsingMode {
     ForceSingleThreaded,
@@ -400,10 +460,11 @@ impl<'a> Parser<'a> {
     /// fallback (`parse_tick_range_continuous`), so velocity and stateful
     /// props here match the full one-shot parse.
     ///
-    /// SoA-only caveat (see `normalize_segment_buckets`): row outputs
-    /// carry every requested key as nulls when never valued in range, but
-    /// `structOfArrays` serialization omits such never-valued columns while
-    /// the full parse emits null-filled ones.
+    /// SoA nuance (see `normalize_segment_buckets`): row outputs carry
+    /// every requested key as nulls when never valued in range, and
+    /// `structOfArrays` serialization emits an explicit `null` for such
+    /// never-valued columns while the full parse emits null-filled arrays
+    /// there — key presence matches, values differ.
     pub fn parse_tick_range(
         &self,
         demo_bytes: &[u8],
@@ -685,7 +746,7 @@ impl<'a> Parser<'a> {
         let mut events_all: Vec<GameEvent> = Vec::new();
         let mut misc: Vec<MiscBucket> = vec![MiscBucket::default(); n];
 
-        for (seg_idx, mut rb, out) in decoded {
+        for (seg_idx, mut rb, mut out) in decoded {
             // Normalize lazy-None columns before routing (see fn docs).
             normalize_segment_buckets(&mut rb);
             let span = segment_tick_span(&shared, seg_idx);
@@ -710,7 +771,22 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-            let mut out = out;
+            // Projectile carry-along: `collect_projectiles` bypasses range
+            // routing and writes grenade rows straight into this segment's
+            // output map (see `partition_unrouted_by_tick`). Route them into
+            // the owning ranges here; without this every plural range output
+            // has an empty `df` when `parse_projectiles` is set.
+            for (orig, part) in partition_unrouted_by_tick(&out.df, &sorted) {
+                df_buckets[orig].push(part);
+            }
+            // `collect_projectiles` never writes per-player maps today (it
+            // pushes to the shared output), but carry any such rows the same
+            // way so the one-range-per-row invariant holds if that changes.
+            for (steamid, pmap) in std::mem::take(&mut out.df_per_player) {
+                for (orig, part) in partition_unrouted_by_tick(&pmap, &sorted) {
+                    pp_buckets[orig].entry(steamid).or_default().push(part);
+                }
+            }
             events_all.extend(out.game_events.drain(..));
             for &orig in &overlapping {
                 let m = &mut misc[orig];
@@ -736,21 +812,16 @@ impl<'a> Parser<'a> {
         Parser::remove_item_sold_events(&mut events_all_mut);
         let mut events_per_range: Vec<Vec<GameEvent>> = vec![Vec::new(); n];
         for e in events_all_mut {
-            for &(lo, hi, orig) in &sorted {
-                if e.tick < lo {
-                    break;
-                }
-                if e.tick <= hi {
-                    events_per_range[orig].push(e);
-                    break;
-                }
+            if let Some(orig) = owner_of(&sorted, e.tick) {
+                events_per_range[orig].push(e);
             }
         }
 
-        // Assemble one DemoOutput per range (input order). SoA-only
-        // residual (see `normalize_segment_buckets`): row outputs carry
-        // every requested key, but `structOfArrays` serialization omits
-        // columns never valued in the decoded segments.
+        // Assemble one DemoOutput per range (input order). SoA nuance
+        // (see `normalize_segment_buckets`): row outputs carry every
+        // requested key, and `structOfArrays` serialization emits an
+        // explicit `null` for columns never valued in the decoded
+        // segments (the full parse emits null-filled arrays there).
         let mut results: Vec<DemoOutput> = Vec::with_capacity(n);
         for orig in 0..n {
             results.push(self.assemble_ranged_output(
