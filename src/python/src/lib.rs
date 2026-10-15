@@ -125,6 +125,40 @@ fn column_is_empty(data: &Option<VarVec>) -> bool {
     }
 }
 
+/// Row count used to size null-filled columns (see `push_null_column`): the
+/// tick column always exists (`PropController` unconditionally registers
+/// tick/steamid/name), so an absent/untyped requested column is padded to its
+/// length. Falls back to the longest present column when tick itself is
+/// missing (e.g. a range that decoded zero rows).
+fn df_row_count(
+    df: &AHashMap<u32, parser::second_pass::variants::PropColumn>,
+    prop_infos: &[parser::first_pass::prop_controller::PropInfo],
+) -> usize {
+    if let Some(tick) = prop_infos.iter().find(|p| p.prop_name == "tick") {
+        if let Some(col) = df.get(&tick.id) {
+            return col.len();
+        }
+    }
+    df.values().map(|c| c.len()).max().unwrap_or(0)
+}
+
+/// Push an all-null column for a requested prop whose decoded column is
+/// absent or untyped (`data: None`), so ranged outputs keep the same shape
+/// as the full parse (which emits such columns null-filled) instead of
+/// silently dropping the key. DTYPE NUANCE: an all-null series is untyped
+/// (NaN/object downstream) where the full parse's column may carry a dtype;
+/// column PRESENCE is what this promises, not dtype parity.
+fn push_null_column(
+    df_column_names_arrow: &mut Vec<String>,
+    friendly_name: &str,
+    n_rows: usize,
+) -> PyResult<Py<PyAny>> {
+    let nulls: Vec<Option<i32>> = vec![None; n_rows];
+    let s = Series::new(friendly_name, nulls);
+    df_column_names_arrow.push(friendly_name.to_string());
+    rust_series_to_py_series(&s)
+}
+
 #[pymethods]
 impl DemoParser {
     #[new]
@@ -152,6 +186,8 @@ impl DemoParser {
             wanted_other_props: vec![],
             wanted_prop_states: AHashMap::default(),
             wanted_events: vec![],
+            collect_ticks: true,
+            parse_voice: false,
             parse_ents: false,
             wanted_ticks: vec![],
             parse_projectiles: false,
@@ -181,6 +217,8 @@ impl DemoParser {
             wanted_other_props: vec![],
             wanted_prop_states: AHashMap::default(),
             wanted_events: vec!["none".to_string()],
+            collect_ticks: false,
+            parse_voice: false,
             parse_ents: true,
             wanted_ticks: vec![],
             parse_projectiles: false,
@@ -208,6 +246,8 @@ impl DemoParser {
             wanted_other_props: vec![],
             wanted_prop_states: AHashMap::default(),
             wanted_events: vec!["all".to_string()],
+            collect_ticks: false,
+            parse_voice: false,
             parse_ents: false,
             wanted_ticks: vec![],
             parse_projectiles: false,
@@ -267,6 +307,8 @@ impl DemoParser {
             wanted_player_props: vec![],
             wanted_other_props: real_other_props,
             wanted_events: vec![],
+            collect_ticks: true,
+            parse_voice: false,
             wanted_prop_states: AHashMap::default(),
             parse_ents: true,
             wanted_ticks: vec![],
@@ -291,6 +333,8 @@ impl DemoParser {
         let prop_infos = output.prop_controller.prop_infos;
         let mut df_column_names_arrow = vec![];
         let mut df_column_names_py = vec![];
+        // Tick-column row count sizing null-filled columns (see `push_null_column`).
+        let n_rows = df_row_count(&output.df, &prop_infos);
 
         for prop_info in prop_infos {
             if output.df.contains_key(&prop_info.id) {
@@ -340,8 +384,27 @@ impl DemoParser {
                         df_column_names_py.push(prop_info.prop_friendly_name);
                         all_pyobjects.push(data.into_py_any(py)?);
                     }
-                    _ => {}
+                    // Typed but unhandled shape (e.g. XYVec): preserve the existing drop.
+                    Some(_) => {}
+                    // Untyped (`data: None`) column: null-fill to keep
+                    // range/full shape parity (see `push_null_column`).
+                    None => {
+                        all_series.push(push_null_column(
+                            &mut df_column_names_arrow,
+                            &prop_info.prop_friendly_name,
+                            n_rows,
+                        )?);
+                    }
                 }
+            } else if !skip_nones {
+                // Requested prop with no decoded column at all (only when no
+                // rows were collected): same null-fill; skipped when the
+                // caller asked to drop empty columns.
+                all_series.push(push_null_column(
+                    &mut df_column_names_arrow,
+                    &prop_info.prop_friendly_name,
+                    n_rows,
+                )?);
             }
         }
         Python::attach(|py| {
@@ -370,6 +433,8 @@ impl DemoParser {
             wanted_other_props: vec![],
             wanted_prop_states: AHashMap::default(),
             wanted_events: vec![],
+            collect_ticks: true,
+            parse_voice: false,
             parse_ents: false,
             wanted_ticks: vec![],
             parse_projectiles: false,
@@ -420,6 +485,8 @@ impl DemoParser {
             wanted_other_props: vec![],
             wanted_prop_states: AHashMap::default(),
             wanted_events: vec![],
+            collect_ticks: true,
+            parse_voice: false,
             parse_ents: false,
             wanted_ticks: vec![],
             parse_projectiles: false,
@@ -506,6 +573,8 @@ impl DemoParser {
             wanted_other_props: vec![],
             wanted_prop_states: AHashMap::default(),
             wanted_events: vec![],
+            collect_ticks: true,
+            parse_voice: false,
             parse_ents: false,
             wanted_ticks: vec![],
             parse_projectiles: false,
@@ -611,6 +680,8 @@ impl DemoParser {
             wanted_player_props: real_player_props,
             wanted_other_props: real_other_props,
             wanted_events: vec![event_name],
+            collect_ticks: false,
+            parse_voice: false,
             wanted_prop_states: AHashMap::default(),
             parse_ents: true,
             wanted_ticks: vec![],
@@ -673,6 +744,8 @@ impl DemoParser {
             wanted_player_props: real_player_props,
             wanted_other_props: real_other_props,
             wanted_events: event_name,
+            collect_ticks: false,
+            parse_voice: false,
             wanted_prop_states: AHashMap::default(),
             parse_ents: true,
             wanted_ticks: vec![],
@@ -704,6 +777,8 @@ impl DemoParser {
             wanted_other_props: vec![],
             wanted_prop_states: AHashMap::default(),
             wanted_events: vec![],
+            collect_ticks: false,
+            parse_voice: true,
             wanted_ticks: vec![],
             real_name_to_og_name: AHashMap::default(),
             parse_ents: false,
@@ -784,6 +859,8 @@ impl DemoParser {
             wanted_player_props: real_props,
             wanted_other_props: vec![],
             wanted_events: vec![],
+            collect_ticks: true,
+            parse_voice: false,
             wanted_prop_states: real_wanted_prop_states,
             parse_ents: true,
             wanted_ticks,
@@ -807,6 +884,8 @@ impl DemoParser {
         let prop_infos = output.prop_controller.prop_infos;
         let mut df_column_names_arrow = vec![];
         let mut df_column_names_py = vec![];
+        // Tick-column row count sizing null-filled columns (see `push_null_column`).
+        let n_rows = df_row_count(&output.df, &prop_infos);
 
         for prop_info in prop_infos {
             if output.df.contains_key(&prop_info.id) {
@@ -919,8 +998,242 @@ impl DemoParser {
                         df_column_names_py.push(prop_info.prop_friendly_name);
                         all_pyobjects.push(dicts.into_py_any(py)?);
                     }
-                    _ => {}
+                    // Typed but unhandled shape (e.g. XYVec): preserve the existing drop.
+                    Some(_) => {}
+                    // Untyped (`data: None`) column: null-fill to keep
+                    // range/full shape parity (see `push_null_column`).
+                    None => {
+                        all_series.push(push_null_column(
+                            &mut df_column_names_arrow,
+                            &prop_info.prop_friendly_name,
+                            n_rows,
+                        )?);
+                    }
                 }
+            } else {
+                // Requested prop with no decoded column at all (only when no
+                // rows were collected): same null-fill as above.
+                all_series.push(push_null_column(
+                    &mut df_column_names_arrow,
+                    &prop_info.prop_friendly_name,
+                    n_rows,
+                )?);
+            }
+        }
+        Python::attach(|py| {
+            let polars = py.import("polars")?;
+            let all_series_py = all_series.into_py_any(py)?;
+            let df = polars.call_method1("DataFrame", (all_series_py,))?;
+            df.setattr("columns", df_column_names_arrow.clone())?;
+            let pandas_df = df.call_method0("to_pandas")?;
+            for (pyobj, col_name) in all_pyobjects.iter().zip(&df_column_names_py) {
+                pandas_df.call_method1("insert", (0, col_name, pyobj))?;
+            }
+            df_column_names_arrow.extend(df_column_names_py);
+            df_column_names_arrow.sort();
+            let kwargs = vec![("axis", 1)].into_py_dict(py).unwrap();
+            let args = (df_column_names_arrow,);
+            pandas_df.call_method("reindex", args, Some(&kwargs))?;
+            pandas_df.into_py_any(py)
+        })
+    }
+
+    /// Bounded-memory slice of `parse_ticks`: only the fullpacket segments
+    /// overlapping `[tick_lo, tick_hi]` are decoded and only rows in range
+    /// are returned. Same DataFrame shape as `parse_ticks`.
+    #[pyo3(signature = (wanted_props, tick_lo, tick_hi, *, players=None))]
+    pub fn parse_tick_range(
+        &self,
+        py: Python,
+        wanted_props: Vec<String>,
+        tick_lo: i32,
+        tick_hi: i32,
+        players: Option<Vec<u64>>,
+    ) -> PyResult<Py<PyAny>> {
+        let wanted_players = players.unwrap_or_default();
+
+        let real_props = rm_user_friendly_names(&wanted_props);
+
+        let real_props = match real_props {
+            Ok(real_props) => real_props,
+            Err(e) => return Err(Exception::new_err(format!("{e}"))),
+        };
+
+        let arc_huf = Arc::new(&self.huf);
+        let mut real_name_to_og_name = AHashMap::default();
+        for (real_name, user_friendly_name) in real_props.iter().zip(&wanted_props) {
+            real_name_to_og_name.insert(real_name.clone(), user_friendly_name.clone());
+        }
+
+        let settings = ParserInputs {
+            real_name_to_og_name,
+            wanted_players,
+            wanted_player_props: real_props,
+            wanted_other_props: vec![],
+            wanted_events: vec![],
+            collect_ticks: true,
+            parse_voice: false,
+            wanted_prop_states: AHashMap::default(),
+            parse_ents: true,
+            wanted_ticks: vec![],
+            parse_projectiles: false,
+            parse_grenades: false,
+            grenade_classes: None,
+            only_header: true,
+            list_props: false,
+            only_convars: false,
+            huffman_lookup_table: &arc_huf,
+            order_by_steamid: false,
+            fallback_bytes: None,
+        };
+        let parser = Parser::new(settings, parser::parse_demo::ParsingMode::Normal);
+        let shared = match parser.preparse(&self.mmap) {
+            Ok(shared) => shared,
+            Err(e) => return Err(Exception::new_err(format!("{e}"))),
+        };
+        let output = match parser.parse_tick_range(&self.mmap, shared, tick_lo, tick_hi) {
+            Ok(output) => output,
+            Err(e) => return Err(Exception::new_err(format!("{e}"))),
+        };
+        let mut all_series = vec![];
+        let mut all_pyobjects = vec![];
+        let prop_infos = output.prop_controller.prop_infos;
+        let mut df_column_names_arrow = vec![];
+        let mut df_column_names_py = vec![];
+        // Tick-column row count sizing null-filled columns (see `push_null_column`).
+        let n_rows = df_row_count(&output.df, &prop_infos);
+
+        for prop_info in prop_infos {
+            if output.df.contains_key(&prop_info.id) {
+                match &output.df[&prop_info.id].data {
+                    Some(VarVec::F32(data)) => {
+                        df_column_names_arrow.push(prop_info.prop_friendly_name);
+                        all_series.push(arr_to_py(Box::new(Float32Array::from(data)))?);
+                    }
+                    Some(VarVec::I32(data)) => {
+                        df_column_names_arrow.push(prop_info.prop_friendly_name);
+                        all_series.push(arr_to_py(Box::new(Int32Array::from(data)))?);
+                    }
+                    Some(VarVec::U64(data)) => {
+                        df_column_names_arrow.push(prop_info.prop_friendly_name);
+                        all_series.push(arr_to_py(Box::new(UInt64Array::from(data)))?);
+                    }
+                    Some(VarVec::U32(data)) => {
+                        df_column_names_arrow.push(prop_info.prop_friendly_name);
+                        all_series.push(arr_to_py(Box::new(UInt32Array::from(data)))?);
+                    }
+                    Some(VarVec::Bool(data)) => {
+                        df_column_names_arrow.push(prop_info.prop_friendly_name);
+                        all_series.push(arr_to_py(Box::new(BooleanArray::from(data)))?);
+                    }
+                    Some(VarVec::String(data)) => {
+                        df_column_names_arrow.push(prop_info.prop_friendly_name.clone());
+                        let s = Series::new(&prop_info.prop_friendly_name.clone(), data);
+                        let py_series = rust_series_to_py_series(&s)?;
+                        all_series.push(py_series);
+                    }
+                    Some(VarVec::StringVec(data)) => {
+                        df_column_names_py.push(prop_info.prop_friendly_name);
+                        all_pyobjects.push(data.into_py_any(py)?);
+                    }
+                    Some(VarVec::U64Vec(data)) => {
+                        df_column_names_py.push(prop_info.prop_friendly_name);
+                        all_pyobjects.push(data.into_py_any(py)?);
+                    }
+                    Some(VarVec::XYZVec(data)) => {
+                        df_column_names_py.push(prop_info.prop_friendly_name);
+                        all_pyobjects.push(data.into_py_any(py)?);
+                    }
+                    Some(VarVec::U32Vec(data)) => {
+                        df_column_names_py.push(prop_info.prop_friendly_name);
+                        all_pyobjects.push(data.into_py_any(py)?);
+                    }
+
+                    Some(VarVec::Stickers(data)) => {
+                        let mut dicts = vec![];
+                        for weapon in data {
+                            let mut v = vec![];
+                            for sticker in weapon {
+                                let dict = PyDict::new(py);
+                                dict.set_item("id", sticker.id)?;
+                                dict.set_item("name", sticker.name.clone())?;
+                                dict.set_item("wear", sticker.wear)?;
+                                dict.set_item("x", sticker.x)?;
+                                dict.set_item("y", sticker.y)?;
+                                v.push(dict);
+                            }
+                            dicts.push(v);
+                        }
+                        df_column_names_py.push(prop_info.prop_friendly_name);
+                        all_pyobjects.push(dicts.into_py_any(py)?);
+                    }
+
+                    Some(VarVec::InputHistory(data)) => {
+                        let mut dicts = vec![];
+                        for input in data {
+                            let mut v = vec![];
+                            for sticker in input {
+                                let dict = PyDict::new(py);
+                                dict.set_item("x", sticker.x)?;
+                                dict.set_item("y", sticker.y)?;
+                                dict.set_item("z", sticker.z)?;
+                                dict.set_item("render_tick_count", sticker.render_tick_count)?;
+                                dict.set_item(
+                                    "render_tick_fraction",
+                                    sticker.render_tick_fraction,
+                                )?;
+                                dict.set_item("player_tick_count", sticker.player_tick_count)?;
+                                dict.set_item(
+                                    "player_tick_fraction",
+                                    sticker.player_tick_fraction,
+                                )?;
+                                v.push(dict);
+                            }
+                            dicts.push(v);
+                        }
+                        df_column_names_py.push(prop_info.prop_friendly_name);
+                        all_pyobjects.push(dicts.into_py_any(py)?);
+                    }
+                    Some(VarVec::UserCmdSubtickMoves(data)) => {
+                        let mut dicts = vec![];
+                        for moves in data {
+                            let mut values = vec![];
+                            for subtick in moves {
+                                let dict = PyDict::new(py);
+                                dict.set_item("when", subtick.when)?;
+                                dict.set_item("button", subtick.button)?;
+                                dict.set_item("pressed", subtick.pressed)?;
+                                dict.set_item("analog_forward", subtick.analog_forward)?;
+                                dict.set_item("analog_left", subtick.analog_left)?;
+                                dict.set_item("pitch_delta", subtick.pitch_delta)?;
+                                dict.set_item("yaw_delta", subtick.yaw_delta)?;
+                                values.push(dict);
+                            }
+                            dicts.push(values);
+                        }
+                        df_column_names_py.push(prop_info.prop_friendly_name);
+                        all_pyobjects.push(dicts.into_py_any(py)?);
+                    }
+                    // Typed but unhandled shape (e.g. XYVec): preserve the existing drop.
+                    Some(_) => {}
+                    // Untyped (`data: None`) column: null-fill to keep
+                    // range/full shape parity (see `push_null_column`).
+                    None => {
+                        all_series.push(push_null_column(
+                            &mut df_column_names_arrow,
+                            &prop_info.prop_friendly_name,
+                            n_rows,
+                        )?);
+                    }
+                }
+            } else {
+                // Requested prop with no decoded column at all (only when no
+                // rows were collected): same null-fill as above.
+                all_series.push(push_null_column(
+                    &mut df_column_names_arrow,
+                    &prop_info.prop_friendly_name,
+                    n_rows,
+                )?);
             }
         }
         Python::attach(|py| {

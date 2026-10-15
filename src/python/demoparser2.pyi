@@ -81,5 +81,29 @@ class DemoParser:
         Returns:
             pd.DataFrame: Dataframe of all the parsed props for each player at each tick.
         """
+    def parse_tick_range(
+        self,
+        wanted_props: Sequence[str],
+        tick_lo: int,
+        tick_hi: int,
+        *,
+        players: Optional[Sequence[int]] = None,
+    ) -> pd.DataFrame:
+        """Parse the specified props for ticks in ``[tick_lo, tick_hi]``.
+
+        Only the fullpacket segments overlapping the range are decoded, so
+        peak memory stays proportional to the slice — never the whole demo.
+        Same DataFrame shape as :meth:`parse_ticks`.
+
+        Args:
+            wanted_props (Sequence[str]): The props to parse for each player at each tick.
+            tick_lo (int): First tick (inclusive).
+            tick_hi (int): Last tick (inclusive).
+            players (Optional[Sequence[int]]): Sequence of Steam IDs of the players to parse.
+                `None` or an empty Sequence means all players. Defaults to `None`.
+
+        Returns:
+            pd.DataFrame: Dataframe of the parsed props for each player at each tick in range.
+        """
 
 __all__ = ["DemoParser", "WantedPropState"]

@@ -63,7 +63,12 @@ impl<'a> SecondPassParser<'a> {
         // rows back out of `output` and they had to be adjacent ticks. The two
         // rows are now kept per player, so the filter always applies and the
         // history is updated on skipped ticks too.
-        if !self.wanted_ticks.contains(&self.tick) && self.wanted_ticks.len() != 0 || self.wanted_events.len() != 0 {
+        //
+        // Tick columns are collected only when the caller opted in via
+        // `collect_ticks` (tick queries, or a unified ticks+events scan).
+        // Event-only queries skip collection to avoid materialising `df`.
+        let tick_wanted = self.wanted_ticks.is_empty() || self.wanted_ticks.contains(&self.tick);
+        if !self.collect_ticks || !tick_wanted {
             if self.prop_controller.event_with_velocity && !self.parse_projectiles {
                 self.update_velocity_history();
             }
@@ -72,6 +77,13 @@ impl<'a> SecondPassParser<'a> {
         if self.parse_projectiles {
             self.collect_projectiles();
             return;
+        }
+        // GATED ROUTING (multi-range only): when bounds are set, this tick's
+        // rows go straight into the matching range bucket — no post-partition
+        // copy. One branch per tick; the fallthrough below is the untouched
+        // full-parse path used by every other caller.
+        if self.range_routing.is_some() {
+            return self.collect_entities_ranged();
         }
         // iterate every player and every wanted prop name
         // if either one is missing then push None to output
@@ -123,6 +135,80 @@ impl<'a> SecondPassParser<'a> {
         // the steamid column does not yet contain the current row (len(X) =
         // len(steamid) + 1), so velocity has always been the delta between the two
         // PREVIOUS rows. Preserve that.
+        if self.prop_controller.needs_velocity {
+            self.update_velocity_history();
+        }
+    }
+
+    /// Routed twin of the player/prop loop above, used only when range
+    /// routing is on. Mirrors its filters and velocity handling exactly;
+    /// only the push targets differ (per-range buckets instead of the shared
+    /// output maps). Ticks outside all ranges still advance velocity history
+    /// so later in-range velocity stays exact.
+    fn collect_entities_ranged(&mut self) {
+        let tick = self.tick;
+        // Ranges replace `wanted_ticks` as the row filter; if both are set,
+        // a tick must pass both (matches the non-routed gate below).
+        let tick_ok = self.wanted_ticks.is_empty() || self.wanted_ticks.contains(&tick);
+        let bucket = match &self.range_routing {
+            Some(r) if tick_ok => r.bounds.iter().position(|&(lo, hi)| tick >= lo && tick <= hi),
+            _ => None,
+        };
+        let Some(ri) = bucket else {
+            // No range wants this tick, but velocity history must still
+            // advance on every decoded tick (mirrors uninterrupted full
+            // parse). Otherwise in-range velocity after a gap would be
+            // computed across the gap instead of between adjacent ticks.
+            if self.prop_controller.needs_velocity || self.prop_controller.event_with_velocity {
+                self.update_velocity_history();
+            }
+            return;
+        };
+        for (entity_id, player) in &self.players {
+            for wanted_prop_state_info in &self.prop_controller.wanted_prop_state_infos {
+                match self.find_prop(&wanted_prop_state_info.base, entity_id, player) {
+                    Ok(prop) => {
+                        if prop != wanted_prop_state_info.wanted_prop_state {
+                            return;
+                        }
+                    }
+                    Err(_e) => return,
+                }
+            }
+
+            let player_steamid = player.steamid.unwrap_or(0);
+            if !self.wanted_players.is_empty() && !self.wanted_players.contains(&player_steamid) {
+                continue;
+            }
+            let mut velocity_indicies: Option<Vec<usize>> = None;
+            let mut button_mask: Option<Option<u64>> = None;
+            if self.order_by_steamid {
+                for prop_info in &self.prop_controller.prop_infos {
+                    // find_prop borrows &self; resolve the value before the &mut buckets borrow.
+                    let val = self.find_prop_with_collect_cache(prop_info, entity_id, player, &mut velocity_indicies, &mut button_mask);
+                    let Some(routing) = self.range_routing.as_mut() else {
+                        return;
+                    };
+                    routing.buckets.per_player[ri]
+                        .entry(player_steamid)
+                        .or_default()
+                        .entry(prop_info.id)
+                        .or_insert_with(PropColumn::new)
+                        .push(val);
+                }
+            } else {
+                for prop_info in &self.prop_controller.prop_infos {
+                    let val = self.find_prop_with_collect_cache(prop_info, entity_id, player, &mut velocity_indicies, &mut button_mask);
+                    let Some(routing) = self.range_routing.as_mut() else {
+                        return;
+                    };
+                    routing.buckets.dfs[ri]
+                        .entry(prop_info.id)
+                        .or_insert_with(PropColumn::new)
+                        .push(val);
+                }
+            }
+        }
         if self.prop_controller.needs_velocity {
             self.update_velocity_history();
         }
