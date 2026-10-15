@@ -312,6 +312,7 @@ impl<'a> SecondPassParser<'a> {
             let fields = match prop_info.prop_type {
                 PropType::Team => self.find_other_team_props(&prop_info),
                 PropType::Rules => self.find_other_rules_props(&prop_info),
+                PropType::C4 => self.find_other_c4_props(&prop_info),
                 PropType::GameTime => vec![EventField {
                     data: Some(Variant::F32(self.net_tick as f32 / 64.0)),
                     name: "game_time".to_string(),
@@ -331,6 +332,18 @@ impl<'a> SecondPassParser<'a> {
                 Err(_e) => None,
             },
             None => None,
+        };
+        extra_fields.push(EventField {
+            name: prop_info.prop_friendly_name.to_owned(),
+            data: prop,
+        });
+        extra_fields
+    }
+    pub fn find_other_c4_props(&self, prop_info: &PropInfo) -> Vec<EventField> {
+        let mut extra_fields = vec![];
+        let prop = match self.get_c4_prop(prop_info) {
+            Ok(p) => Some(p),
+            Err(_e) => None,
         };
         extra_fields.push(EventField {
             name: prop_info.prop_friendly_name.to_owned(),

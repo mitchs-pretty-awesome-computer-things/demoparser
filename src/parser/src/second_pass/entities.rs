@@ -44,6 +44,7 @@ pub enum EntityType {
     Team,
     Normal,
     C4,
+    PlantedC4,
 }
 enum EntityCmd {
     Delete,
@@ -78,6 +79,24 @@ impl<'a> SecondPassParser<'a> {
             match cmd {
                 EntityCmd::Delete => {
                     self.projectiles.remove(&entity_id);
+                    // Drop tracked C4 entity ids along with the entity. The
+                    // ids are otherwise left pointing at a cleared slot (or a
+                    // slot reused by another class), which would mask the
+                    // carried-C4 fallback and could resolve stale props.
+                    // Packet entries are ordered by entity id, not lifecycle,
+                    // so only clear a tracker when it points at this exact
+                    // entity; a replacement created earlier in the packet must
+                    // survive the later delete of the entity it replaced.
+                    let deleted_type = self
+                        .entities
+                        .get(entity_id as usize)
+                        .and_then(|slot| slot.as_ref())
+                        .map(|entity| entity.entity_type.clone());
+                    match deleted_type {
+                        Some(EntityType::C4) => self.c4_entity_id = clear_tracker_on_delete(self.c4_entity_id, entity_id),
+                        Some(EntityType::PlantedC4) => self.planted_c4_entity_id = clear_tracker_on_delete(self.planted_c4_entity_id, entity_id),
+                        _ => {}
+                    }
                     if let Some(entry) = self.entities.get_mut(entity_id as usize) {
                         *entry = None;
                     }
@@ -342,6 +361,7 @@ impl<'a> SecondPassParser<'a> {
             }
             EntityType::Rules => self.rules_entity_id = Some(*entity_id),
             EntityType::C4 => self.c4_entity_id = Some(*entity_id),
+            EntityType::PlantedC4 => self.planted_c4_entity_id = Some(*entity_id),
             _ => {}
         };
         let entity = Entity {
@@ -382,6 +402,7 @@ impl<'a> SecondPassParser<'a> {
             "CCSGameRulesProxy" => return Ok(EntityType::Rules),
             "CCSTeam" => return Ok(EntityType::Team),
             "CC4" => return Ok(EntityType::C4),
+            "CPlantedC4" => return Ok(EntityType::PlantedC4),
             _ => {}
         }
         let is_projectile_prop =
@@ -398,6 +419,10 @@ impl<'a> SecondPassParser<'a> {
 fn should_emit_prop_to_listen(prop_name: &str) -> bool {
     match prop_name.split(".").next() {
         Some("CCSGameRulesProxy") => return true,
+        Some("CPlantedC4") => return true,
+        // The carried C4 (CC4) is also whitelisted so demos that only expose
+        // the blow timer on the carried entity still surface it in list_props.
+        Some("CC4") => return true,
         Some("CCSTeam") => return true,
         Some("CCSPlayerPawn") => return true,
         Some("CCSPlayerController") => return true,
@@ -439,4 +464,52 @@ fn is_grenade_prop(full_name: &str) -> bool {
         }
     }
     false
+}
+
+/// Clear a tracked entity id on deletion only when the delete targets that
+/// exact id. Packet entries are ordered by entity id rather than lifecycle, so
+/// a replacement created earlier in the packet must survive the later delete
+/// of the entity it replaced.
+fn clear_tracker_on_delete(tracker: Option<i32>, deleted_entity_id: i32) -> Option<i32> {
+    match tracker {
+        Some(id) if id == deleted_entity_id => None,
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_tracker_on_delete_leaves_replacement_tracked() {
+        // A replacement created earlier in the packet (lower entity id) must
+        // not be wiped by the later delete of the entity it replaced.
+        assert_eq!(clear_tracker_on_delete(Some(30), 50), Some(30));
+    }
+
+    #[test]
+    fn clear_tracker_on_delete_clears_the_tracked_entity() {
+        assert_eq!(clear_tracker_on_delete(Some(50), 50), None);
+    }
+
+    #[test]
+    fn clear_tracker_on_delete_is_a_noop_without_a_tracker() {
+        assert_eq!(clear_tracker_on_delete(None, 50), None);
+    }
+
+    #[test]
+    fn c4_props_are_emitted_to_listeners() {
+        // The blow timer may live on either the planted or the carried bomb
+        // depending on the demo version, so both classes must pass the filter.
+        assert!(should_emit_prop_to_listen("CPlantedC4.m_flC4Blow"));
+        assert!(should_emit_prop_to_listen("CC4.m_flC4Blow"));
+        assert!(!should_emit_prop_to_listen("CEnvEntityMaker.m_flC4Blow"));
+    }
+
+    #[test]
+    fn carried_c4_props_use_the_weapon_prefix() {
+        assert_eq!(convert_weapon_prefix_to_general("CC4.m_flC4Blow"), "Weapon.m_flC4Blow");
+        assert_eq!(convert_weapon_prefix_to_general("CPlantedC4.m_flC4Blow"), "Weapon.m_flC4Blow");
+    }
 }

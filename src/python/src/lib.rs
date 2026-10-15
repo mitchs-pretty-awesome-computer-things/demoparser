@@ -172,7 +172,7 @@ impl DemoParser {
         Ok(output)
     }
 
-    /// Returns the names of game events present in the demo
+    /// Returns the names of props that are present and update in the demo
     pub fn list_updated_fields(&self, _py: Python<'_>) -> PyResult<Vec<String>> {
         let settings = ParserInputs {
             real_name_to_og_name: AHashMap::default(),
