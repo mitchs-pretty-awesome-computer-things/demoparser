@@ -52,6 +52,9 @@ mod tests {
             wanted_prop_states: Default::default(),
             wanted_ticks: vec![],
             wanted_events: vec![],
+            collect_ticks: false,
+            parse_voice: false,
+            grenade_classes: None,
             parse_ents: true,
             parse_projectiles: false,
             parse_grenades: false,
@@ -76,7 +79,8 @@ mod tests {
             prop_friendly_name: "health".to_string(),
             is_player_prop: true,
         }];
-        let mut parser = SecondPassParser::new(first_pass.create_first_pass_output().unwrap(), 0, false, None).unwrap();
+        let shared = first_pass.into_shared().unwrap();
+        let mut parser = SecondPassParser::new(&shared, &settings, 0, false, None).unwrap();
         parser.entities.resize(0x4000, None);
         // A controller index above 2047 also exercises PlayerConnect's plain-index path.
         let controller_id = 4097;
