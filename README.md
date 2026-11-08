@@ -1,3 +1,6 @@
+**Archived and read-only.** Active development, releases, and issue tracking have moved to
+**[CounterStrat/demoparser](https://github.com/counterstrat/demoparser)**.
+
 # Demo parser for Counter-Strike 2
 
 We now have a discord channel: [Discord](https://discord.gg/rNUjS4vfnX)
